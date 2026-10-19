@@ -1,6 +1,8 @@
-# Python-to-RISC-V Compiler
+# vipyr
 
-An experimental compiler for a statically checked subset of Python. The compiler lowers Python source code to LLVM IR, applies LLVM optimization passes, generates RISC-V32 code, and executes the resulting program inside a Buildroot system running under QEMU.
+**A compiler for a statically typed subset of Python, targeting 32-bit RISC-V through LLVM.**
+
+vipyr is an experimental compiler for a statically checked subset of Python. It lowers Python source code to LLVM IR, applies LLVM optimization passes, generates RISC-V32 code, and executes the resulting program inside a Buildroot system running under QEMU.
 
 This repository is primarily a compiler-construction and optimization research prototype. It is not a complete Python implementation and should not be expected to compile arbitrary Python programs.
 

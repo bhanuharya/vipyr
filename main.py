@@ -11,7 +11,7 @@ def main():
 
     Currently the only commandline argument is the single python file to compile
     """
-    parser = argparse.ArgumentParser(prog='PythonRISCV')
+    parser = argparse.ArgumentParser(prog='vipyr')
     parser.add_argument('filein')
     parser.add_argument('--bits', '-b', type=int, default=32)
     parser.add_argument('--output', '-o', default='out.ll',

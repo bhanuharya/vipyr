@@ -1,5 +1,5 @@
 """
-Reference evaluator (oracle) for the pyrv scalar language subset.
+Reference evaluator (oracle) for the vipyr language subset.
 
 This interpreter walks the type-checked AST (the same CheckedNode tree the
 LLVM backend consumes) and executes it using pure Python values.  It is

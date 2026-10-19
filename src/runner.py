@@ -1,5 +1,5 @@
 """
-Build/run harness for the pyrv compiler.
+Build/run harness for the vipyr compiler.
 
 This module separates the *compile* (frontend, opt, llc, link) and *execute*
 (QEMU) steps from the compiler itself, and resolves all external tool paths
@@ -306,7 +306,7 @@ def build_and_run(src: str, passes: str | None = DEFAULT_PASSES,
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog='python -m src.runner',
-        description='Compile a pyrv program to RISC-V and run it under QEMU.')
+        description='Compile a vipyr program to RISC-V and run it under QEMU.')
     parser.add_argument('src', help='input .py file')
     parser.add_argument('--passes', default=DEFAULT_PASSES,
                         help=f'opt pass pipeline, "" for none (default: {DEFAULT_PASSES})')
