@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import ast
 import io
-import os
 import shutil
 import tempfile
 from pathlib import Path
@@ -87,10 +86,7 @@ def qemu_output(src: str, passes: str | None = DEFAULT_PASSES,
 def toolchain_available() -> bool:
     """True if the full external toolchain is present."""
     try:
-        runner._check_tool(runner.opt_path(), 'opt')
-        runner._check_tool(runner.llc_path(), 'llc')
-        runner._check_tool(runner.cc_path(), 'clang')
-        runner._check_tool(runner.qemu_user_path(), 'qemu-riscv32')
-        return os.path.isdir(runner.sysroot_path())
+        runner.check_toolchain()
+        return True
     except runner.ToolchainError:
         return False
