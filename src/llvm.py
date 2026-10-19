@@ -96,6 +96,12 @@ class LLVMBackend():
             ir.IntType(REGISTER_SIZE),
         ]), 'pyr_bounds_check')
 
+        # pyr_ipow(i32 base, i32 exp) -> i32  (int ** int)
+        pyr_ipow = ir.Function(self.module, ir.FunctionType(ir.IntType(REGISTER_SIZE), [
+            ir.IntType(REGISTER_SIZE),
+            ir.IntType(REGISTER_SIZE),
+        ]), 'pyr_ipow')
+
         self.symbols[0]['memcpy'] = LLVMSymbol( FnType([], noneType()),  memcpy)
         self.symbols[0]['printf'] = LLVMSymbol( FnType([], noneType()),  printf)
         self.symbols[0]['readln'] = LLVMSymbol( FnType([], noneType()),  readline)
@@ -104,9 +110,11 @@ class LLVMBackend():
         self.symbols[0]['pyr_alloc_init'] = LLVMSymbol( FnType([], noneType()), pyr_alloc_init)
         self.symbols[0]['sprintf'] = LLVMSymbol( FnType([], noneType()), sprintf)
         self.symbols[0]['pyr_bounds_check'] = LLVMSymbol( FnType([], noneType()), pyr_bounds_check)
+        self.symbols[0]['pyr_ipow'] = LLVMSymbol( FnType([], noneType()), pyr_ipow)
         self.symbols[0]['strlen'] = LLVMSymbol( FnType([], noneType()),  strlen)
 
         self.breakBlock: list[ir.Block] = list()
+        self.continueBlock: list[ir.Block] = list()
 
         self.globalCount = 0
 
@@ -344,6 +352,8 @@ class LLVMBackend():
                 return self.evalWhile(node)
             case ast.Break():
                 return self.evalBreak(node)
+            case ast.Continue():
+                return self.evalContinue(node)
             case ast.Pass():
                 return None
             case ast.BoolOp():
@@ -487,6 +497,11 @@ class LLVMBackend():
         assert len(self.breakBlock) > 0
         assert node is not None
         self.builder.branch(self.breakBlock[-1])
+
+    def evalContinue(self, node: CheckedNode) -> None:
+        assert len(self.continueBlock) > 0
+        assert node is not None
+        self.builder.branch(self.continueBlock[-1])
 
     def evalIf(self, node: CheckedIfNode) -> None:
         #@TODO: ternary operators
@@ -647,6 +662,8 @@ class LLVMBackend():
         condB = self.fn.append_basic_block('cond')
         # Make a block for the body of the for loop
         bodyB = self.fn.append_basic_block('for-body')
+        # Make a block that increments idx; `continue` jumps here
+        nextB = self.fn.append_basic_block('for-next')
         # Make a block for the orelse of the for loop
         orelseB = self.fn.append_basic_block('orelse-body')
         # Make a block for after the loop is done
@@ -678,15 +695,21 @@ class LLVMBackend():
         self.doStore(sym.ptr, elem, sym.t)
 
         # Evaluate the body
-        # if it's not terminated increment idx and go to the condition
+        # if it's not terminated go to the increment block
         self.breakBlock.append(afterB)
+        self.continueBlock.append(nextB)
         for stmt in node.body:
             self.evalNode(stmt, False)
         if not self.isTerminated():
-            incr = self.builder.add(i, self.getConstant(1))
-            self.builder.store(incr, idx)
-            self.builder.branch(condB)
+            self.builder.branch(nextB)
+        self.continueBlock.pop()
         self.breakBlock.pop()
+
+        # Increment idx and go to the condition
+        self.builder.position_at_end(nextB)
+        incr = self.builder.add(i, self.getConstant(1))
+        self.builder.store(incr, idx)
+        self.builder.branch(condB)
 
         # Pop the symbol scope for the for loop
         self.symbols.pop()
@@ -714,7 +737,9 @@ class LLVMBackend():
         self.builder.cbranch(expr, fortrue, orelse)
 
         self.breakBlock.append(after)
+        self.continueBlock.append(cond)
         self.evalBody(node.iftrue, fortrue, cond)
+        self.continueBlock.pop()
         self.breakBlock.pop()
 
         self.evalBody(node.orelse, orelse, after)
@@ -757,13 +782,35 @@ class LLVMBackend():
             ast.Mod: (self.builder.frem, self.builder.srem)
         }
 
+        if t.isInt():
+            match bop:
+                case ast.Div() | ast.Mod():
+                    return self.doIntDivRem(left, right, isinstance(bop, ast.Mod))
+                case ast.FloorDiv():
+                    return self.doIntFloorDiv(left, right)
+                case ast.Pow():
+                    return self.builder.call(self.symbols[0]['pyr_ipow'].ptr, [left, right])
+                case ast.BitAnd():
+                    return self.builder.and_(left, right)
+                case ast.BitOr():
+                    return self.builder.or_(left, right)
+                case ast.BitXor():
+                    return self.builder.xor(left, right)
+                case ast.LShift() | ast.RShift():
+                    # Like RISC-V sll/sra, use only the low 5 bits of the
+                    # count. This also keeps LLVM shl/ashr defined: they
+                    # are poison for counts >= 32. The mask costs nothing
+                    # on RISC-V, where the shift instructions ignore the
+                    # upper bits anyway.
+                    count = self.builder.and_(right, ir.Constant(right.type, right.type.width - 1))
+                    if isinstance(bop, ast.LShift):
+                        return self.builder.shl(left, count)
+                    return self.builder.ashr(left, count)
+
         got = ops.get(type(bop))
         if got is None:
             print(f'Invalid binary operator {bop}')
             assert False
-
-        if t.isInt() and isinstance(bop, (ast.Div, ast.Mod)):
-            return self.doIntDivRem(left, right, isinstance(bop, ast.Mod))
 
         fn = got[0 if t.isFloat() else 1]
         result = fn(left, right)
@@ -789,6 +836,19 @@ class LLVMBackend():
             return self.builder.select(isZero, left, self.builder.srem(left, safeRight))
         return self.builder.select(isZero, minusOne, self.builder.sdiv(left, safeRight))
 
+    def doIntFloorDiv(self, left: ir.Value, right: ir.Value) -> ir.Value:
+        # CPython floor division on top of the total truncating division:
+        # step the quotient down when the remainder is non-zero and its sign
+        # differs from the divisor's. x // 0 == -1, as for `/`.
+        zero = ir.Constant(left.type, 0)
+        quot = self.doIntDivRem(left, right, False)
+        rem = self.doIntDivRem(left, right, True)
+        adjust = self.builder.and_(
+            self.builder.and_(self.builder.icmp_signed('!=', rem, zero),
+                              self.builder.icmp_signed('!=', right, zero)),
+            self.builder.icmp_signed('<', self.builder.xor(rem, right), zero))
+        return self.builder.sub(quot, self.builder.zext(adjust, left.type))
+
     def evalUnaryOp(self, node: CheckedUnaryOpNode) -> ir.Value:
         val = self.evalNode(node.operand, False)
         assert val is not None
@@ -800,7 +860,8 @@ class LLVMBackend():
                 return self.builder.neg(val)
             case ast.UAdd():
                 return val
-            case ast.Not():
+            case ast.Not() | ast.Invert():
+                # xor with all ones: logical not on i1, bitwise ~ on i32
                 return self.builder.not_(val)
             case _:
                 raise CompileError(f'Unsupported unary operator {type(node.op).__name__}')

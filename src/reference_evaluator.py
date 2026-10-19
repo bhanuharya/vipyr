@@ -19,6 +19,8 @@ docs/language-spec.md and the LLVM backend in src/llvm.py:
   zero is defined with the RISC-V M-extension results (x / 0 == -1,
   x % 0 == x).
 - float is IEEE-754 double precision; `%` between floats is C fmod.
+- `//`, `**`, `&`, `|`, `^`, `<<`, `>>` and `~` are int-only and total
+  (spec §2.1); shift counts use only their low 5 bits.
 - print formatting matches the C printf conversions used by the backend:
   int → %d, float → %f (6 decimals), bool → %d (0/1), str → %s, char → %c.
 - `and` / `or` short-circuit and require bool operands.
@@ -69,6 +71,10 @@ class _Return(Exception):
 
 
 class _Break(Exception):
+    pass
+
+
+class _Continue(Exception):
     pass
 
 
@@ -174,6 +180,8 @@ class ReferenceEvaluator:
             return
         if isinstance(base, ast.Break):
             raise _Break()
+        if isinstance(base, ast.Continue):
+            raise _Continue()
         if isinstance(base, ast.Pass):
             return
         # Expression statement (the type checker unwraps ast.Expr).
@@ -226,6 +234,8 @@ class ReferenceEvaluator:
             self.push_scope()
             try:
                 self._exec_statements(stmt.iftrue)
+            except _Continue:
+                pass
             except _Break:
                 # break jumps past the else clause.
                 return
@@ -246,6 +256,8 @@ class ReferenceEvaluator:
             self.scopes[-1][var_name] = item
             try:
                 self._exec_statements(stmt.body)
+            except _Continue:
+                pass
             except _Break:
                 # break jumps past the else clause.
                 return
@@ -385,9 +397,37 @@ class ReferenceEvaluator:
             res = ReferenceEvaluator._div(left, right)
         elif isinstance(op, ast.Mod):
             res = ReferenceEvaluator._mod(left, right)
+        elif isinstance(op, ast.FloorDiv):
+            # x // 0 == -1, as for `/`.
+            res = -1 if right == 0 else left // right
+        elif isinstance(op, ast.Pow):
+            res = ReferenceEvaluator._ipow(left, right)
+        elif isinstance(op, ast.BitAnd):
+            res = left & right
+        elif isinstance(op, ast.BitOr):
+            res = left | right
+        elif isinstance(op, ast.BitXor):
+            res = left ^ right
+        elif isinstance(op, ast.LShift):
+            # Only the low 5 bits of the count are used (RISC-V sll/sra).
+            res = left << (right & 31)
+        elif isinstance(op, ast.RShift):
+            res = left >> (right & 31)
         else:
             raise InterpretError(f'Unsupported binary operator: {type(op).__name__}')
         return wrap_i32(res) if _is_int(res) else res
+
+    @staticmethod
+    def _ipow(base, exp):
+        # Wraps modulo 2^32 (via the caller). A negative exponent gives the
+        # truncated value of 1 / base**-exp, with 1 / 0 == -1 as for `/`.
+        if exp < 0:
+            if base == 1:
+                return 1
+            if base == -1:
+                return -1 if exp & 1 else 1
+            return -1 if base == 0 else 0
+        return pow(base, exp, 1 << 32)
 
     def _eval_unaryop(self, node: CheckedUnaryOpNode):
         value = self._eval_expr(node.operand)
@@ -398,6 +438,8 @@ class ReferenceEvaluator:
             return value
         if isinstance(op, ast.Not):
             return not value
+        if isinstance(op, ast.Invert):
+            return ~value
         raise InterpretError(f'Unsupported unary operator: {type(op).__name__}')
 
     def _eval_compare(self, node: CheckedBinNode):

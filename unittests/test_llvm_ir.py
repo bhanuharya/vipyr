@@ -75,6 +75,43 @@ print(f(7, 0))
         llvm.parse_assembly(ir_text_for(self.SRC)).verify()
 
 
+class TestIntOnlyOperators(unittest.TestCase):
+    SRC = '''
+def f(a: int, n: int) -> int:
+    x = (a << n) + (a >> n) + a // n + a ** n + (a & n) + (a | n) + (a ^ n) + ~a
+    for i in range(3):
+        if i == 1:
+            continue
+        x += i
+    while x > 100:
+        x -= 1
+        if x == 50:
+            continue
+    return x
+print(f(7, 2))
+'''
+
+    def test_shift_counts_are_masked(self):
+        # LLVM shl/ashr are poison for counts >= 32; the count must come
+        # from `and n, 31`.
+        mod = llvm.parse_assembly(ir_text_for(self.SRC))
+        shifts = 0
+        for fn in mod.functions:
+            for bb in fn.blocks:
+                for ins in bb.instructions:
+                    if ins.opcode in ('shl', 'ashr'):
+                        shifts += 1
+                        count = str(list(ins.operands)[1]).strip()
+                        self.assertRegex(count, r'= and i32 .*, 31$', f'unmasked count in: {ins}')
+        self.assertEqual(shifts, 2)
+
+    def test_pow_calls_runtime(self):
+        self.assertIn('call i32 @"pyr_ipow"', ir_text_for(self.SRC))
+
+    def test_module_verifies(self):
+        llvm.parse_assembly(ir_text_for(self.SRC)).verify()
+
+
 class TestIRVerifies(unittest.TestCase):
     def test_verify_accepts(self):
         src = '''

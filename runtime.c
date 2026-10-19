@@ -2,8 +2,8 @@
  * pyrv runtime library
  *
  * Provides a simple bump allocator for heap-allocated buffers (list element
- * arrays, concatenated/repeated string buffers, etc.) plus an optional
- * subscript bounds-check helper.
+ * arrays, concatenated/repeated string buffers, etc.), integer `**`, and an
+ * optional subscript bounds-check helper.
  *
  * Design notes:
  *   - The heap is a single mmap'd region, allocated lazily on first use.
@@ -60,6 +60,35 @@ void *pyr_alloc(uint32_t size)
     void *result = (void *)pyr_bump;
     pyr_bump += aligned;
     return result;
+}
+
+/*
+ * Integer exponentiation for `**` on int (see docs/language-spec.md).
+ * Wraps modulo 2^32 like the other int operators: unsigned multiplication
+ * is exact modulo 2^32, so squaring and multiplying never loses bits that
+ * matter. A negative exponent gives the truncated value of
+ * 1 / base**-exp, with 1 / 0 == -1 as for `/`.
+ */
+int32_t pyr_ipow(int32_t base, int32_t exp)
+{
+    if (exp < 0) {
+        if (base == 1) {
+            return 1;
+        }
+        if (base == -1) {
+            return (exp & 1) ? -1 : 1;
+        }
+        return base == 0 ? -1 : 0;
+    }
+    uint32_t result = 1u;
+    uint32_t b = (uint32_t)base;
+    for (uint32_t e = (uint32_t)exp; e != 0u; e >>= 1) {
+        if (e & 1u) {
+            result *= b;
+        }
+        b *= b;
+    }
+    return (int32_t)result;
 }
 
 /*
