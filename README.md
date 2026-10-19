@@ -1,6 +1,8 @@
-# Python-to-RISC-V Compiler
+# vipyr
 
-An experimental compiler for a statically checked subset of Python. The compiler lowers Python source code to LLVM IR, applies LLVM optimization passes, generates RISC-V32 code, and executes the resulting program inside a Buildroot system running under QEMU.
+**A compiler for a statically typed subset of Python, targeting 32-bit RISC-V through LLVM.**
+
+vipyr is an experimental compiler for a statically checked subset of Python. It lowers Python source code to LLVM IR, applies LLVM optimization passes, generates RISC-V32 code, and executes the resulting program inside a Buildroot system running under QEMU.
 
 This repository is primarily a compiler-construction and optimization research prototype. It is not a complete Python implementation and should not be expected to compile arbitrary Python programs.
 
@@ -69,6 +71,27 @@ static typing, 32-bit `int`). The normative specification is
 `docs/language-spec.md`; the runtime model is documented in
 `docs/runtime-model.md`.
 
+## Quick start
+
+Compiling and running programs on RISC-V needs only stock tools. The custom
+LLVM 14 build, Buildroot image, and `sudo` steps under [Setup](#setup) are
+needed only for the original full-system QEMU experiments.
+
+```bash
+sudo apt install qemu-user llvm          # qemu-riscv32, opt, llc (LLVM 14+)
+python3.12 -m venv .venv                 # llvmlite 0.43 needs Python <= 3.12
+. .venv/bin/activate
+pip install -r requirements.txt          # llvmlite, ziglang
+python -m src.runner tests/standard.py   # compile to RISC-V, run under QEMU
+./run_regression_tests.sh                # full suite, including QEMU runs
+```
+
+Without a glibc cross toolchain (`PYRV_CC` or
+`riscv32-unknown-linux-gnu-clang` on `PATH`), the runner links with Zig's
+bundled clang and musl. The result is a static rv32gc/ilp32d executable that
+`qemu-riscv32` runs without a sysroot. Validated with Ubuntu 24.04, LLVM 18,
+QEMU 8.2, and Zig 0.17.
+
 ## Testing
 
 ```bash
@@ -83,8 +106,8 @@ evaluator, and compares optimized vs. unoptimized binaries. Tool paths are
 resolved from `PYRV_OPT`, `PYRV_LLC`, `PYRV_CC`, `PYRV_SYSROOT`, and
 `PYRV_QEMU_USER` (see `src/runner.py`).
 
-For a full target run, `PYRV_CC` must be a Linux RISC-V32 **cross-Clang**
-capable of consuming the generated LLVM IR. A bare RISC-V GCC cannot be used
+To use a glibc toolchain instead of the Zig fallback, `PYRV_CC` must be a
+Linux RISC-V32 **cross-Clang** capable of consuming the generated LLVM IR. A bare RISC-V GCC cannot be used
 directly because the runner passes `.ll`/`.bc` files to the link stage; a
 wrapper may first compile those inputs to objects and then link them with a
 Buildroot GCC driver.

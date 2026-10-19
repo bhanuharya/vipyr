@@ -4,6 +4,17 @@ import ast
 from .checked_nodes import *
 
 
+# Binary operators defined only for int operands (see docs/language-spec.md).
+INT_ONLY_OPS = {
+    ast.FloorDiv: '//',
+    ast.Pow: '**',
+    ast.BitAnd: '&',
+    ast.BitOr: '|',
+    ast.BitXor: '^',
+    ast.LShift: '<<',
+    ast.RShift: '>>',
+}
+
 """
 The TypeChecker class goes through Python's AST (that we get from calling ast.parse)
 and assigns a type to each node, if there is an invalid/incompattible type or an unsupported node we raise an error and quit
@@ -159,6 +170,8 @@ class TypeChecker():
                 return self.evalFor(node)
             case ast.Break():
                 return self.evalBreak(node)
+            case ast.Continue():
+                return self.evalContinue(node)
             case ast.Pass():
                 return CheckedNode(node, noneType())
             case ast.BoolOp():
@@ -273,6 +286,23 @@ class TypeChecker():
 
         self.bodyTerminated = True
         return CheckedNode(node, noneType())
+
+    def evalContinue(self, node: ast.Continue):
+        """
+        Continue Node:
+            Like break, only valid inside a loop
+        """
+        self.errorInfo.lineNo = node.lineno
+        if self.breakableCtx is False:
+            raiseError(self.errorInfo, f'continue outside of a loop is not valid')
+
+        self.bodyTerminated = True
+        return CheckedNode(node, noneType())
+
+    def checkIntOnlyOp(self, op, left: Class, right: Class):
+        symbol = INT_ONLY_OPS.get(type(op))
+        if symbol is not None and not (left.isInt() and right.isInt()):
+            raiseError(self.errorInfo, f'Operator {symbol} requires int operands, got {left} and {right}')
 
     def evalWhile(self, node: ast.While) -> CheckedIfNode:
         """
@@ -633,7 +663,8 @@ class TypeChecker():
         right = self.evalNode(node.value)
         if not left.t.isAssignable(right.t):
             raiseError(self.errorInfo, f'Cannot assign value of type {right.t} to variable of type {left.t}')
-        
+        self.checkIntOnlyOp(node.op, left.t, right.t)
+
         return CheckedBinNode(node, left, right, node.op)
 
     def evalUnaryOp(self, node: ast.UnaryOp) -> CheckedUnaryOpNode:
@@ -655,6 +686,11 @@ class TypeChecker():
         if isinstance(node.op, (ast.USub, ast.UAdd)):
             if not (operand.t.isInt() or operand.t.isFloat()):
                 raiseError(self.errorInfo, f'Operand of unary {type(node.op).__name__} is of type {operand.t}, expected int or float')
+            return CheckedUnaryOpNode(node, operand, node.op)
+
+        if isinstance(node.op, ast.Invert):
+            if not operand.t.isInt():
+                raiseError(self.errorInfo, f'Operand of ~ is of type {operand.t}, expected int')
             return CheckedUnaryOpNode(node, operand, node.op)
 
         raiseError(self.errorInfo, f'Unsupported unary operator {type(node.op).__name__}')
@@ -754,6 +790,7 @@ class TypeChecker():
             result.t = right.t  # result is str, not int
             return result
 
+        self.checkIntOnlyOp(node.op, left.t, right.t)
         if left.t.canPerformBinOp(right.t, node.op):
             return CheckedBinNode(node, left, right, node.op)
         

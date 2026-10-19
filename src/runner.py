@@ -1,5 +1,5 @@
 """
-Build/run harness for the pyrv compiler.
+Build/run harness for the vipyr compiler.
 
 This module separates the *compile* (frontend, opt, llc, link) and *execute*
 (QEMU) steps from the compiler itself, and resolves all external tool paths
@@ -8,8 +8,8 @@ suite and can be used interactively.
 
 Environment variable configuration:
 
-    PYRV_OPT        path to opt (default: opt-14)
-    PYRV_LLC        path to llc with RISC-V backend (default: llc-14)
+    PYRV_OPT        path to opt (default: opt-14, then opt)
+    PYRV_LLC        path to llc with RISC-V backend (default: llc-14, then llc)
     PYRV_CC         path to the RISC-V cross-clang (default:
                     riscv32-unknown-linux-gnu-clang)
     PYRV_SYSROOT    cross sysroot for --sysroot (default: /opt/riscv/sysroot)
@@ -18,13 +18,26 @@ Environment variable configuration:
     PYRV_RUNTIME_LIB path to a runtime shared dir containing readline.c
                      (used when readline.c is not in the current dir)
     PYRV_RUNTIME    path to runtime.c (heap allocator) (default: ./runtime.c)
+
+When neither PYRV_CC nor riscv32-unknown-linux-gnu-clang is available, the
+link step falls back to Zig's bundled clang and musl (`pip install
+ziglang`). That needs no sysroot and produces static rv32gc/ilp32d binaries.
+
+Command line:
+
+    python -m src.runner prog.py [--passes simplifycfg,instcombine]
 """
 
 from __future__ import annotations
 
+import argparse
+import functools
+import importlib.util
 import os
+import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -34,6 +47,10 @@ DEFAULT_PASSES = 'simplifycfg,instcombine,sroa,dce'
 RISCV_MARCH = 'rv32gc'
 RISCV_MABI = 'ilp32d'
 LLC_MATTRS = '+m,+a,+f,+d'
+
+# Zig fallback: baseline_rv32 is rv32gc, which selects the ilp32d ABI.
+ZIG_TARGET = 'riscv32-linux-musl'
+ZIG_CPU = 'baseline_rv32'
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -54,12 +71,22 @@ def _which(default: str, env: str) -> str:
     return name if name else default
 
 
+def _which_any(defaults: list[str], env: str) -> str:
+    """Like _which, but without an override try each default on PATH."""
+    if not os.environ.get(env):
+        for name in defaults:
+            resolved = shutil.which(name)
+            if resolved:
+                return resolved
+    return _which(defaults[0], env)
+
+
 def opt_path() -> str:
-    return _which('opt-14', 'PYRV_OPT')
+    return _which_any(['opt-14', 'opt'], 'PYRV_OPT')
 
 
 def llc_path() -> str:
-    return _which('llc-14', 'PYRV_LLC')
+    return _which_any(['llc-14', 'llc'], 'PYRV_LLC')
 
 
 def cc_path() -> str:
@@ -116,6 +143,56 @@ def _check_tool(path: str, name: str):
         raise ToolchainError(f'{name} not found or not executable: {path}')
 
 
+@functools.lru_cache(maxsize=None)
+def _opt_has_no_verify_fixpoint(opt: str) -> bool:
+    proc = subprocess.run([opt, '-passes=instcombine<no-verify-fixpoint>',
+                           '-disable-output'], input='', capture_output=True)
+    return proc.returncode == 0
+
+
+def opt_pipeline(opt: str, passes: str) -> str:
+    """
+    Turn off instcombine's fixpoint self-check where opt supports it.
+
+    Since LLVM 18, naming `instcombine` in -passes runs one iteration and
+    aborts if more work remains. It is a check for LLVM's own tests (the -O
+    pipelines leave it off), it does not indicate a miscompile, and it
+    fires on tests/medium.py.
+    """
+    if not _opt_has_no_verify_fixpoint(opt):
+        return passes
+    return re.sub(r'\binstcombine\b(?!<)', 'instcombine<no-verify-fixpoint>', passes)
+
+
+def use_zig() -> bool:
+    """True when linking falls back to Zig + musl (see module docstring)."""
+    if os.environ.get('PYRV_CC') or shutil.which('riscv32-unknown-linux-gnu-clang'):
+        return False
+    return importlib.util.find_spec('ziglang') is not None
+
+
+def link_command() -> list[str]:
+    """Compiler-driver prefix that links IR/C inputs into a RISC-V executable."""
+    if use_zig():
+        return [sys.executable, '-m', 'ziglang', 'cc', '-target', ZIG_TARGET,
+                f'-mcpu={ZIG_CPU}', '-Wno-override-module']
+    cc = cc_path()
+    _check_tool(cc, 'clang')
+    return [cc, f'--sysroot={sysroot_path()}', f'-march={RISCV_MARCH}',
+            f'-mabi={RISCV_MABI}']
+
+
+def check_toolchain():
+    """Raise ToolchainError unless everything needed for a target run is present."""
+    _check_tool(opt_path(), 'opt')
+    _check_tool(llc_path(), 'llc')
+    _check_tool(qemu_user_path(), 'qemu-riscv32')
+    if not use_zig():
+        _check_tool(cc_path(), 'clang')
+        if not os.path.isdir(sysroot_path()):
+            raise ToolchainError(f'sysroot not found: {sysroot_path()}')
+
+
 def compile_program(src: str, out_dir: str, passes: str | None = None,
                     name: str | None = None,
                     bounds_check: bool = False) -> dict[str, str]:
@@ -149,14 +226,15 @@ def compile_program(src: str, out_dir: str, passes: str | None = None,
     opt = opt_path()
     _check_tool(opt, 'opt')
     if passes:
-        proc = _run([opt, str(ir), '-o', str(opt_bc), '-passes=' + passes])
+        proc = _run([opt, str(ir), '-o', str(opt_bc),
+                     '-passes=' + opt_pipeline(opt, passes)])
         if proc.returncode != 0:
             raise ToolchainError(f'opt failed:\n{proc.stderr}')
     else:
         opt_bc = ir
 
     # Always verify the module that will be code-generated.
-    proc = _run([opt, str(opt_bc), '-verify', '-S', '-o', os.devnull])
+    proc = _run([opt, str(opt_bc), '-passes=verify', '-S', '-o', os.devnull])
     if proc.returncode != 0:
         raise ToolchainError(f'opt -verify failed:\n{proc.stderr}')
 
@@ -168,13 +246,9 @@ def compile_program(src: str, out_dir: str, passes: str | None = None,
     if proc.returncode != 0:
         raise ToolchainError(f'llc failed:\n{proc.stderr}')
 
-    # Link.
-    cc = cc_path()
-    _check_tool(cc, 'clang')
-    sysroot = sysroot_path()
-    proc = _run([cc, f'--sysroot={sysroot}', f'-march={RISCV_MARCH}',
-                 f'-mabi={RISCV_MABI}', str(opt_bc), readline_path(),
-                 runtime_path(), '-o', str(exe)])
+    # Link. Float `%` lowers to a call to fmod, hence -lm.
+    proc = _run(link_command() + [str(opt_bc), readline_path(),
+                                  runtime_path(), '-lm', '-o', str(exe)])
     if proc.returncode != 0:
         raise ToolchainError(f'link failed:\n{proc.stderr}')
 
@@ -197,7 +271,9 @@ def run_qemu(exe: str, stdin: str | None = None, timeout: int = 120,
     qemu = qemu_user_path()
     _check_tool(qemu, 'qemu-riscv32')
     sysroot = sysroot_path()
-    cmd = [qemu, '-L', sysroot, str(exe)]
+    # -L lets QEMU find a glibc sysroot's dynamic loader. Static Zig/musl
+    # binaries don't need one, so skip it when there is no sysroot.
+    cmd = [qemu, '-L', sysroot, str(exe)] if os.path.isdir(sysroot) else [qemu, str(exe)]
     try:
         proc = subprocess.run(
             cmd, input=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -225,3 +301,36 @@ def build_and_run(src: str, passes: str | None = DEFAULT_PASSES,
     finally:
         if not keep:
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog='python -m src.runner',
+        description='Compile a vipyr program to RISC-V and run it under QEMU.')
+    parser.add_argument('src', help='input .py file')
+    parser.add_argument('--passes', default=DEFAULT_PASSES,
+                        help=f'opt pass pipeline, "" for none (default: {DEFAULT_PASSES})')
+    parser.add_argument('--bounds-check', action='store_true',
+                        help='emit runtime bounds checks for subscripts')
+    parser.add_argument('--keep', metavar='DIR',
+                        help='write the .ll/.s/.riscv artifacts to DIR')
+    args = parser.parse_args(argv)
+
+    out_dir = args.keep or tempfile.mkdtemp(prefix='pyrv-')
+    try:
+        arts = compile_program(args.src, out_dir, passes=args.passes or None,
+                               bounds_check=args.bounds_check)
+        code, out, err = run_qemu(arts['exe'])
+        sys.stdout.buffer.write(out)
+        sys.stderr.buffer.write(err)
+        return code
+    except ToolchainError as e:
+        print(f'error: {e}', file=sys.stderr)
+        return 2
+    finally:
+        if not args.keep:
+            shutil.rmtree(out_dir, ignore_errors=True)
+
+
+if __name__ == '__main__':
+    sys.exit(main())

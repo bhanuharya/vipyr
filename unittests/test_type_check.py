@@ -74,6 +74,25 @@ print(fib(10))
         typecheck_source(src)
 
 
+    def test_int_only_operators(self):
+        src = '''
+a = 6
+b = 3
+c = a // b + a ** b + (a & b) + (a | b) + (a ^ b) + (a << b) + (a >> b) + ~a
+a //= 2
+a **= 2
+a &= 7
+a |= 8
+a ^= 1
+a <<= 1
+a >>= 1
+'''
+        typecheck_source(src)
+
+    def test_continue_in_loops(self):
+        typecheck_source('for i in range(3):\n    continue\nwhile False:\n    continue\n')
+
+
 class TestTypeCheckerRejects(unittest.TestCase):
     def assert_compile_error(self, src, *fragments):
         with self.assertRaises(CompileError) as cm:
@@ -99,6 +118,24 @@ class TestTypeCheckerRejects(unittest.TestCase):
 
     def test_break_outside_loop(self):
         self.assert_compile_error('break\n', 'break outside')
+
+    def test_continue_outside_loop(self):
+        self.assert_compile_error('continue\n', 'continue outside')
+
+    def test_int_only_operators_reject_other_types(self):
+        cases = [
+            ('a = 7.0 // 2.0\n', '//'),
+            ('a = 2.0 ** 3.0\n', '**'),
+            ('a = True & False\n', '&'),
+            ('a = 1.5 << 1.5\n', '<<'),
+            ('a = 1.0\na //= 2.0\n', '//'),
+        ]
+        for src, symbol in cases:
+            with self.subTest(src=src):
+                self.assert_compile_error(src, f'Operator {symbol} requires int operands')
+
+    def test_invert_of_float_rejected(self):
+        self.assert_compile_error('a = ~1.5\n', 'Operand of ~')
 
     def test_non_bool_condition(self):
         self.assert_compile_error('if 1:\n    pass\n', 'not a boolean')
@@ -172,6 +209,82 @@ class TestOracleSemantics(unittest.TestCase):
         out, status = oracle_output('print(-7 % 3)\nprint(7 % -3)\n')
         self.assertEqual(status, 0)
         self.assertEqual(out, '-1\n1\n')
+
+    def test_int_division_by_zero_is_riscv_result(self):
+        out, status = oracle_output('a = 7\nb = 0\nprint(a / b)\nprint(a % b)\n')
+        self.assertEqual(status, 0)
+        self.assertEqual(out, '-1\n7\n')
+
+    def test_int_division_overflow_wraps(self):
+        src = 'a = -2147483647 - 1\nb = -1\nprint(a / b)\nprint(a % b)\n'
+        out, status = oracle_output(src)
+        self.assertEqual(status, 0)
+        self.assertEqual(out, '-2147483648\n0\n')
+
+    def test_aug_assign_wraps(self):
+        # Regression: `+=` used to skip the i32 wrap that `x = x + 1` applied.
+        src = 'x = 2147483647\nx += 1\nprint(x)\na = [2147483647]\na[0] *= 2\nprint(a[0])\n'
+        out, status = oracle_output(src)
+        self.assertEqual(status, 0)
+        self.assertEqual(out, '-2147483648\n-2\n')
+
+    def test_float_mod_is_fmod(self):
+        out, status = oracle_output('print(-7.0 % 3.0)\nprint(7.0 % -3.0)\nprint(7.0 % 0.0)\n')
+        self.assertEqual(status, 0)
+        self.assertEqual(out, '-1.000000\n1.000000\nnan\n')
+
+    def test_float_division_by_zero_is_ieee(self):
+        out, status = oracle_output('print(7.0 / 0.0)\nprint(-7.0 / 0.0)\nprint(0.0 / 0.0)\n')
+        self.assertEqual(status, 0)
+        self.assertEqual(out, 'inf\n-inf\nnan\n')
+
+    def test_floor_division(self):
+        src = 'm = -2147483647 - 1\nprint(-7 // 2, 7 // -2, 7 // 2, -7 // -2)\nprint(7 // 0, -7 // 0, m // -1)\n'
+        out, status = oracle_output(src)
+        self.assertEqual(status, 0)
+        self.assertEqual(out, '-4 -4 3 3\n-1 -1 -2147483648\n')
+
+    def test_int_pow_wraps(self):
+        out, status = oracle_output('print(3 ** 21, 2 ** 31, 2 ** 32, (-3) ** 3, 0 ** 0)\n')
+        self.assertEqual(status, 0)
+        self.assertEqual(out, '1870418611 -2147483648 0 -27 1\n')
+
+    def test_int_pow_negative_exponent(self):
+        m = '(-2147483647 - 1)'
+        out, status = oracle_output(f'print(1 ** -5, (-1) ** -3, (-1) ** -4, 0 ** -1, 2 ** -1, (-1) ** {m})\n')
+        self.assertEqual(status, 0)
+        self.assertEqual(out, '1 -1 1 -1 0 1\n')
+
+    def test_shift_count_uses_low_5_bits(self):
+        out, status = oracle_output('print(1 << 33, 1 << -1, 1 << 31, -8 >> 1, -8 >> 33, 5 >> 32)\n')
+        self.assertEqual(status, 0)
+        self.assertEqual(out, '2 -2147483648 -2147483648 -4 -4 5\n')
+
+    def test_bitwise_and_invert(self):
+        out, status = oracle_output('print(-6 & 3, -6 | 3, -6 ^ 3, ~0, ~-1, ~2147483647)\n')
+        self.assertEqual(status, 0)
+        self.assertEqual(out, '2 -5 -7 -1 0 -2147483648\n')
+
+    def test_continue_keeps_loop_else(self):
+        src = '''
+for i in range(5):
+    if i % 2 == 0:
+        continue
+    print(i)
+else:
+    print("for done")
+n = 0
+while n < 5:
+    n += 1
+    if n == 3:
+        continue
+    print(n)
+else:
+    print("while done")
+'''
+        out, status = oracle_output(src)
+        self.assertEqual(status, 0)
+        self.assertEqual(out, '1\n3\nfor done\n1\n2\n4\n5\nwhile done\n')
 
     def test_bool_print_is_01(self):
         out, status = oracle_output('print(True)\nprint(False)\n')

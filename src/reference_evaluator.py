@@ -1,5 +1,5 @@
 """
-Reference evaluator (oracle) for the pyrv scalar language subset.
+Reference evaluator (oracle) for the vipyr language subset.
 
 This interpreter walks the type-checked AST (the same CheckedNode tree the
 LLVM backend consumes) and executes it using pure Python values.  It is
@@ -15,8 +15,12 @@ docs/language-spec.md and the LLVM backend in src/llvm.py:
 
 - int is a 32-bit two's-complement value; arithmetic wraps (LLVM i32).
 - `/` between ints is truncating integer division (sdiv semantics);
-  `%` between ints is the signed remainder (srem semantics).
-- float is IEEE-754 double precision.
+  `%` between ints is the signed remainder (srem semantics). Division by
+  zero is defined with the RISC-V M-extension results (x / 0 == -1,
+  x % 0 == x).
+- float is IEEE-754 double precision; `%` between floats is C fmod.
+- `//`, `**`, `&`, `|`, `^`, `<<`, `>>` and `~` are int-only and total
+  (spec §2.1); shift counts use only their low 5 bits.
 - print formatting matches the C printf conversions used by the backend:
   int → %d, float → %f (6 decimals), bool → %d (0/1), str → %s, char → %c.
 - `and` / `or` short-circuit and require bool operands.
@@ -67,6 +71,10 @@ class _Return(Exception):
 
 
 class _Break(Exception):
+    pass
+
+
+class _Continue(Exception):
     pass
 
 
@@ -172,6 +180,8 @@ class ReferenceEvaluator:
             return
         if isinstance(base, ast.Break):
             raise _Break()
+        if isinstance(base, ast.Continue):
+            raise _Continue()
         if isinstance(base, ast.Pass):
             return
         # Expression statement (the type checker unwraps ast.Expr).
@@ -224,6 +234,8 @@ class ReferenceEvaluator:
             self.push_scope()
             try:
                 self._exec_statements(stmt.iftrue)
+            except _Continue:
+                pass
             except _Break:
                 # break jumps past the else clause.
                 return
@@ -244,6 +256,8 @@ class ReferenceEvaluator:
             self.scopes[-1][var_name] = item
             try:
                 self._exec_statements(stmt.body)
+            except _Continue:
+                pass
             except _Break:
                 # break jumps past the else clause.
                 return
@@ -307,44 +321,43 @@ class ReferenceEvaluator:
     def _eval_binop(self, node: CheckedBinNode):
         left = self._eval_expr(node.left)
         right = self._eval_expr(node.right)
-        op = node.op
-        if isinstance(op, ast.Add):
-            res = left + right
-        elif isinstance(op, ast.Sub):
-            res = left - right
-        elif isinstance(op, ast.Mult):
-            res = left * right
-        elif isinstance(op, ast.Div):
-            res = self._div(left, right)
-        elif isinstance(op, ast.Mod):
-            res = self._mod(left, right)
-        else:
-            raise InterpretError(f'Unsupported binary operator: {type(op).__name__}')
-        return wrap_i32(res) if _is_int(res) else res
+        return self._apply_binop(left, right, node.op)
 
     @staticmethod
     def _div(a, b):
         if _is_int(a) and _is_int(b):
-            # C sdiv semantics: truncation toward zero.
+            # C sdiv semantics: truncation toward zero. A zero divisor gives
+            # the RISC-V M-extension result (-1); INT_MIN / -1 wraps to
+            # INT_MIN in the caller.
             if b == 0:
-                raise InterpretError('Integer division by zero')
+                return -1
             q = abs(a) // abs(b)
             if (a < 0) != (b < 0):
                 q = -q
             return q
+        if b == 0.0:
+            # IEEE-754: x / ±0 is ±inf (sign of a XOR sign of b), 0 / 0 is nan.
+            if a == 0.0 or math.isnan(a):
+                return math.nan
+            return math.copysign(math.inf, math.copysign(1.0, a) * math.copysign(1.0, b))
         return a / b
 
     @staticmethod
     def _mod(a, b):
         if _is_int(a) and _is_int(b):
-            # C srem semantics: remainder has the sign of the dividend.
+            # C srem semantics: remainder has the sign of the dividend. A zero
+            # divisor gives the RISC-V M-extension result (the dividend).
             if b == 0:
-                raise InterpretError('Integer modulo by zero')
+                return a
             r = abs(a) % abs(b)
             if a < 0:
                 r = -r
             return r
-        return a % b
+        # LLVM frem is C fmod (sign of the dividend), not CPython's floor
+        # modulo. math.fmod raises where C returns nan.
+        if b == 0.0 or math.isinf(a) or math.isnan(a) or math.isnan(b):
+            return math.nan
+        return math.fmod(a, b)
 
     def _eval_augassign(self, node: CheckedBinNode):
         # Evaluate the lvalue once: the index expression may have side
@@ -373,17 +386,48 @@ class ReferenceEvaluator:
 
     @staticmethod
     def _apply_binop(left, right, op):
+        # Shared by plain and augmented binops so both wrap to i32.
         if isinstance(op, ast.Add):
-            return left + right
-        if isinstance(op, ast.Sub):
-            return left - right
-        if isinstance(op, ast.Mult):
-            return left * right
-        if isinstance(op, ast.Div):
-            return ReferenceEvaluator._div(left, right)
-        if isinstance(op, ast.Mod):
-            return ReferenceEvaluator._mod(left, right)
-        raise InterpretError(f'Unsupported augmented assignment operator: {type(op).__name__}')
+            res = left + right
+        elif isinstance(op, ast.Sub):
+            res = left - right
+        elif isinstance(op, ast.Mult):
+            res = left * right
+        elif isinstance(op, ast.Div):
+            res = ReferenceEvaluator._div(left, right)
+        elif isinstance(op, ast.Mod):
+            res = ReferenceEvaluator._mod(left, right)
+        elif isinstance(op, ast.FloorDiv):
+            # x // 0 == -1, as for `/`.
+            res = -1 if right == 0 else left // right
+        elif isinstance(op, ast.Pow):
+            res = ReferenceEvaluator._ipow(left, right)
+        elif isinstance(op, ast.BitAnd):
+            res = left & right
+        elif isinstance(op, ast.BitOr):
+            res = left | right
+        elif isinstance(op, ast.BitXor):
+            res = left ^ right
+        elif isinstance(op, ast.LShift):
+            # Only the low 5 bits of the count are used (RISC-V sll/sra).
+            res = left << (right & 31)
+        elif isinstance(op, ast.RShift):
+            res = left >> (right & 31)
+        else:
+            raise InterpretError(f'Unsupported binary operator: {type(op).__name__}')
+        return wrap_i32(res) if _is_int(res) else res
+
+    @staticmethod
+    def _ipow(base, exp):
+        # Wraps modulo 2^32 (via the caller). A negative exponent gives the
+        # truncated value of 1 / base**-exp, with 1 / 0 == -1 as for `/`.
+        if exp < 0:
+            if base == 1:
+                return 1
+            if base == -1:
+                return -1 if exp & 1 else 1
+            return -1 if base == 0 else 0
+        return pow(base, exp, 1 << 32)
 
     def _eval_unaryop(self, node: CheckedUnaryOpNode):
         value = self._eval_expr(node.operand)
@@ -394,6 +438,8 @@ class ReferenceEvaluator:
             return value
         if isinstance(op, ast.Not):
             return not value
+        if isinstance(op, ast.Invert):
+            return ~value
         raise InterpretError(f'Unsupported unary operator: {type(op).__name__}')
 
     def _eval_compare(self, node: CheckedBinNode):

@@ -186,6 +186,120 @@ print(x, y, z, w, v)
 '''
         self.check_equivalence(src)
 
+    def test_int_division_is_total(self):
+        # LLVM sdiv/srem are UB for these inputs; the binary must produce
+        # the RISC-V results the oracle models. Function arguments keep the
+        # divisors away from constant folding.
+        src = '''
+def div(a: int, b: int) -> int:
+    return a / b
+
+def rem(a: int, b: int) -> int:
+    return a % b
+
+m = -2147483647 - 1
+print(div(7, 0), rem(7, 0))
+print(div(-7, 0), rem(-7, 0))
+print(div(m, -1), rem(m, -1))
+print(div(-7, 2), rem(-7, 2))
+x = 9
+x /= 0
+y = 9
+y %= 0
+print(x, y)
+'''
+        self.check_equivalence(src)
+        self.check_equivalence(src, passes=DEFAULT_PASSES)
+
+    def test_aug_assign_wraps(self):
+        src = '''
+x = 2147483647
+x += 1
+a = [2147483647]
+a[0] *= 2
+print(x, a[0])
+'''
+        self.check_equivalence(src)
+
+    def test_float_division_and_mod(self):
+        src = '''
+def fdivide(a: float, b: float) -> float:
+    return a / b
+
+def fremainder(a: float, b: float) -> float:
+    return a % b
+
+print(fdivide(7.0, 0.0), fdivide(-7.0, 0.0), fdivide(0.0, 0.0))
+print(fremainder(-7.0, 3.0), fremainder(7.0, -3.0), fremainder(7.0, 0.0))
+'''
+        self.check_equivalence(src)
+
+    def test_int_only_operators(self):
+        # Function arguments keep every operand away from constant folding,
+        # so the RISC-V code itself computes each edge case.
+        src = '''
+def fdiv(a: int, b: int) -> int:
+    return a // b
+
+def power(a: int, b: int) -> int:
+    return a ** b
+
+def shl(a: int, b: int) -> int:
+    return a << b
+
+def shr(a: int, b: int) -> int:
+    return a >> b
+
+def bits(a: int, b: int) -> int:
+    return (a & b) + (a | b) * 3 + (a ^ b) * 7 + ~a
+
+m = -2147483647 - 1
+print(fdiv(-7, 2), fdiv(7, -2), fdiv(7, 2), fdiv(-7, -2), fdiv(7, 0), fdiv(-7, 0), fdiv(m, -1))
+print(power(3, 21), power(2, 31), power(2, 32), power(-3, 3), power(0, 0))
+print(power(1, -5), power(-1, -3), power(-1, -4), power(0, -1), power(2, -1), power(-1, m))
+print(shl(1, 33), shl(1, -1), shl(1, 31), shr(-8, 1), shr(-8, 33), shr(5, 32))
+print(bits(-6, 3), bits(12345, -987))
+x = 5
+x //= 2
+x **= 3
+x <<= 2
+x >>= 1
+x &= 63
+x |= 64
+x ^= 5
+print(x)
+'''
+        self.check_equivalence(src)
+        self.check_equivalence(src, passes=DEFAULT_PASSES)
+
+    def test_continue(self):
+        src = '''
+def count(n: int) -> int:
+    total = 0
+    for i in range(n):
+        if i % 3 == 0:
+            continue
+        total += i
+    else:
+        total += 1000
+    j = 0
+    while j < n:
+        j += 1
+        if j % 2 == 0:
+            continue
+        total += j
+    return total
+
+print(count(10))
+items = ["a", "skip", "b"]
+for it in items:
+    if it == "skip":
+        continue
+    print(it)
+'''
+        self.check_equivalence(src)
+        self.check_equivalence(src, passes=DEFAULT_PASSES)
+
     def test_aug_assign_subscript_pure_index(self):
         # The "consistently wrong" case: the index has no side effects
         # so both the old and the new lowering produce the same answer.

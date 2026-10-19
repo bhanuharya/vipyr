@@ -67,7 +67,8 @@ int(3.9)      # 3     (float -> int, truncates toward zero)
 ### 2.1 Binary operators
 
 `+`, `-`, `*`, `/`, `%` are supported. Both operands must have the same
-type; there is no implicit promotion.
+type; there is no implicit promotion. `//`, `**`, `&`, `|`, `^`, `<<`, and
+`>>` are supported on `int` only (see below).
 
 * **int**: `+`, `-`, `*` wrap modulo 2^32. `/` is **truncating integer
   division** and `%` is the **signed remainder** (C `sdiv`/`srem`
@@ -85,9 +86,39 @@ type; there is no implicit promotion.
   (`"ab" * 3 == 3 * "ab" == "ababab"`). A negative repeat count yields
   the empty string, matching CPython (`"ab" * -1 == ""`).
 
-Division by zero: for `int`, behavior is target-defined (on RISC-V the
-hardware returns `-1` for `/` and the dividend for `%`); for `float`, the
-IEEE result is produced (`inf`/`nan`). Programs should not rely on it.
+Integer division is a total function. On every target it produces the
+RISC-V M-extension results, with no trap:
+
+```
+x / 0                == -1
+x % 0                == x
+-2147483648 / -1     == -2147483648     # wraps
+-2147483648 % -1     == 0
+```
+
+The backend guards LLVM `sdiv`/`srem`, which are undefined behavior for
+these inputs; the guards fold away when the divisor is a constant.
+
+For `float`, division by zero gives the IEEE result (`inf`, `-inf`, or
+`nan`), and `%` is C `fmod` (LLVM `frem`): the result has the sign of the
+dividend, *not* CPython's floor modulo (`-7.0 % 3.0 == -1.0`; CPython gives
+`2.0`).
+
+**int-only operators.** Every one is a total function: no input traps or is
+undefined.
+
+* `//` is CPython floor division (`-7 // 2 == -4`), unlike the truncating
+  `/`. `x // 0 == -1`, as for `/`, and `-2147483648 // -1` wraps to
+  `-2147483648`.
+* `**` wraps modulo 2^32 (`3 ** 21 == 1870418611`). A negative exponent
+  gives the truncated value of `1 / x**-n`: `1` for `x == 1`, `±1` for
+  `x == -1`, `-1` for `x == 0` (that is, `1 / 0`), and `0` otherwise. It is
+  computed by the runtime helper `pyr_ipow`.
+* `&`, `|`, `^` are bitwise on the 32-bit two's-complement value.
+* `<<` and arithmetic `>>` use only the low 5 bits of the shift count, as
+  RISC-V `sll`/`sra` (and Java) do: `1 << 33 == 2`, `1 << -1 ==
+  -2147483648`, `-8 >> 1 == -4`. `<<` wraps modulo 2^32. Unmasked, LLVM
+  `shl`/`ashr` would be poison for counts of 32 or more.
 
 ### 2.2 Comparisons
 
@@ -99,7 +130,8 @@ IEEE result is produced (`inf`/`nan`). Programs should not rely on it.
 
 ### 2.3 Unary operators
 
-`+x`, `-x` on `int`/`float`; `not b` on `bool`. Integer negation wraps.
+`+x`, `-x` on `int`/`float`; `~x` (bitwise not, `-x - 1`) on `int`;
+`not b` on `bool`. Integer negation wraps.
 
 ### 2.4 Boolean operators
 
@@ -117,13 +149,13 @@ if items and items[0]:  # rejected: lists have no truthiness
 ## 3. Statements and control flow
 
 Supported: assignment, augmented assignment, subscript assignment,
-`if`/`else`, `while`, `for`/`else`, `break`, `pass`, function definition,
-`return`, expression statements.
+`if`/`else`, `while`, `for`/`else`, `break`, `continue`, `pass`, function
+definition, `return`, expression statements.
 
 * `while`/`for` may have an `else` clause, which runs when the loop
   terminates normally (condition false / sequence exhausted) and is skipped
-  by `break` — matching CPython.
-* `break` is only valid inside a loop.
+  by `break` — matching CPython. `continue` does not skip it.
+* `break` and `continue` are only valid inside a loop.
 * A function whose declared return type is not `None` must return a value on
   every path, or compilation fails.
 * `a[i] = x` writes to the `i`-th element of a list; `x` must be assignable
@@ -222,16 +254,19 @@ concatenated, or stored like any other string.
 ## 8. Deliberate deviations from CPython
 
 1. **Truncating integer division/remainder** (`/`, `%` on `int`) — C
-   `sdiv`/`srem`, not floor.
+   `sdiv`/`srem`, not floor. Division by zero returns the RISC-V results
+   instead of raising `ZeroDivisionError`. `%` on `float` is C `fmod`.
 2. **No implicit numeric promotion** — `1 + 1.0` is a compile error.
 3. **`bool` is not `int`** and prints as `0`/`1`.
 4. **Static typing** — a variable's type is fixed at first assignment.
 5. **Assignment to an existing outer name rebinds it** — no CPython-style
    local shadowing on assignment.
 6. **No truthiness** — conditions and `and`/`or` operands must be `bool`.
-7. **32-bit `int`** with wraparound, not arbitrary precision.
-8. **No runtime errors for** division-by-zero (int), out-of-range indexing,
-   or out-of-range `int(float)` — these are undefined behavior.
+7. **32-bit `int`** with wraparound, not arbitrary precision. Shift counts
+   use only their low 5 bits, and `**` with a negative exponent stays an
+   `int` (CPython returns a `float`).
+8. **No runtime errors for** out-of-range indexing or out-of-range
+   `int(float)` — these are undefined behavior.
    Exception: with `--bounds-check`, out-of-range/negative subscripts are a
    checked runtime error (stderr diagnostic + exit status 1).
 

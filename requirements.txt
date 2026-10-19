@@ -1,1 +1,4 @@
 llvmlite==0.43.0
+# Links RISC-V executables (bundled clang + musl) when no glibc cross
+# toolchain is configured; see src/runner.py.
+ziglang==0.17.0
