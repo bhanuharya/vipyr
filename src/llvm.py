@@ -762,10 +762,32 @@ class LLVMBackend():
             print(f'Invalid binary operator {bop}')
             assert False
 
+        if t.isInt() and isinstance(bop, (ast.Div, ast.Mod)):
+            return self.doIntDivRem(left, right, isinstance(bop, ast.Mod))
+
         fn = got[0 if t.isFloat() else 1]
         result = fn(left, right)
         assert result is not None
         return result
+
+    def doIntDivRem(self, left: ir.Value, right: ir.Value, isRem: bool) -> ir.Value:
+        # LLVM sdiv/srem are undefined behavior for a zero divisor and for
+        # INT_MIN / -1, and the optimizer may exploit that. Divide by a safe
+        # divisor instead and select the RISC-V M-extension results:
+        # x / 0 == -1, x % 0 == x, INT_MIN / -1 == INT_MIN, INT_MIN % -1 == 0.
+        # The guards fold away when the divisor is a constant.
+        intT = left.type
+        minusOne = ir.Constant(intT, -1)
+        intMin = ir.Constant(intT, -(1 << (intT.width - 1)))
+        isZero = self.builder.icmp_signed('==', right, ir.Constant(intT, 0))
+        isOverflow = self.builder.and_(
+            self.builder.icmp_signed('==', left, intMin),
+            self.builder.icmp_signed('==', right, minusOne))
+        safeRight = self.builder.select(
+            self.builder.or_(isZero, isOverflow), ir.Constant(intT, 1), right)
+        if isRem:
+            return self.builder.select(isZero, left, self.builder.srem(left, safeRight))
+        return self.builder.select(isZero, minusOne, self.builder.sdiv(left, safeRight))
 
     def evalUnaryOp(self, node: CheckedUnaryOpNode) -> ir.Value:
         val = self.evalNode(node.operand, False)

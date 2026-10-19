@@ -186,6 +186,54 @@ print(x, y, z, w, v)
 '''
         self.check_equivalence(src)
 
+    def test_int_division_is_total(self):
+        # LLVM sdiv/srem are UB for these inputs; the binary must produce
+        # the RISC-V results the oracle models. Function arguments keep the
+        # divisors away from constant folding.
+        src = '''
+def div(a: int, b: int) -> int:
+    return a / b
+
+def rem(a: int, b: int) -> int:
+    return a % b
+
+m = -2147483647 - 1
+print(div(7, 0), rem(7, 0))
+print(div(-7, 0), rem(-7, 0))
+print(div(m, -1), rem(m, -1))
+print(div(-7, 2), rem(-7, 2))
+x = 9
+x /= 0
+y = 9
+y %= 0
+print(x, y)
+'''
+        self.check_equivalence(src)
+        self.check_equivalence(src, passes=DEFAULT_PASSES)
+
+    def test_aug_assign_wraps(self):
+        src = '''
+x = 2147483647
+x += 1
+a = [2147483647]
+a[0] *= 2
+print(x, a[0])
+'''
+        self.check_equivalence(src)
+
+    def test_float_division_and_mod(self):
+        src = '''
+def fdivide(a: float, b: float) -> float:
+    return a / b
+
+def fremainder(a: float, b: float) -> float:
+    return a % b
+
+print(fdivide(7.0, 0.0), fdivide(-7.0, 0.0), fdivide(0.0, 0.0))
+print(fremainder(-7.0, 3.0), fremainder(7.0, -3.0), fremainder(7.0, 0.0))
+'''
+        self.check_equivalence(src)
+
     def test_aug_assign_subscript_pure_index(self):
         # The "consistently wrong" case: the index has no side effects
         # so both the old and the new lowering produce the same answer.

@@ -85,9 +85,23 @@ type; there is no implicit promotion.
   (`"ab" * 3 == 3 * "ab" == "ababab"`). A negative repeat count yields
   the empty string, matching CPython (`"ab" * -1 == ""`).
 
-Division by zero: for `int`, behavior is target-defined (on RISC-V the
-hardware returns `-1` for `/` and the dividend for `%`); for `float`, the
-IEEE result is produced (`inf`/`nan`). Programs should not rely on it.
+Integer division is a total function. On every target it produces the
+RISC-V M-extension results, with no trap:
+
+```
+x / 0                == -1
+x % 0                == x
+-2147483648 / -1     == -2147483648     # wraps
+-2147483648 % -1     == 0
+```
+
+The backend guards LLVM `sdiv`/`srem`, which are undefined behavior for
+these inputs; the guards fold away when the divisor is a constant.
+
+For `float`, division by zero gives the IEEE result (`inf`, `-inf`, or
+`nan`), and `%` is C `fmod` (LLVM `frem`): the result has the sign of the
+dividend, *not* CPython's floor modulo (`-7.0 % 3.0 == -1.0`; CPython gives
+`2.0`).
 
 ### 2.2 Comparisons
 
@@ -222,7 +236,8 @@ concatenated, or stored like any other string.
 ## 8. Deliberate deviations from CPython
 
 1. **Truncating integer division/remainder** (`/`, `%` on `int`) — C
-   `sdiv`/`srem`, not floor.
+   `sdiv`/`srem`, not floor. Division by zero returns the RISC-V results
+   instead of raising `ZeroDivisionError`. `%` on `float` is C `fmod`.
 2. **No implicit numeric promotion** — `1 + 1.0` is a compile error.
 3. **`bool` is not `int`** and prints as `0`/`1`.
 4. **Static typing** — a variable's type is fixed at first assignment.
@@ -230,8 +245,8 @@ concatenated, or stored like any other string.
    local shadowing on assignment.
 6. **No truthiness** — conditions and `and`/`or` operands must be `bool`.
 7. **32-bit `int`** with wraparound, not arbitrary precision.
-8. **No runtime errors for** division-by-zero (int), out-of-range indexing,
-   or out-of-range `int(float)` — these are undefined behavior.
+8. **No runtime errors for** out-of-range indexing or out-of-range
+   `int(float)` — these are undefined behavior.
    Exception: with `--bounds-check`, out-of-range/negative subscripts are a
    checked runtime error (stderr diagnostic + exit status 1).
 

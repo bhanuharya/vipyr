@@ -173,6 +173,34 @@ class TestOracleSemantics(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertEqual(out, '-1\n1\n')
 
+    def test_int_division_by_zero_is_riscv_result(self):
+        out, status = oracle_output('a = 7\nb = 0\nprint(a / b)\nprint(a % b)\n')
+        self.assertEqual(status, 0)
+        self.assertEqual(out, '-1\n7\n')
+
+    def test_int_division_overflow_wraps(self):
+        src = 'a = -2147483647 - 1\nb = -1\nprint(a / b)\nprint(a % b)\n'
+        out, status = oracle_output(src)
+        self.assertEqual(status, 0)
+        self.assertEqual(out, '-2147483648\n0\n')
+
+    def test_aug_assign_wraps(self):
+        # Regression: `+=` used to skip the i32 wrap that `x = x + 1` applied.
+        src = 'x = 2147483647\nx += 1\nprint(x)\na = [2147483647]\na[0] *= 2\nprint(a[0])\n'
+        out, status = oracle_output(src)
+        self.assertEqual(status, 0)
+        self.assertEqual(out, '-2147483648\n-2\n')
+
+    def test_float_mod_is_fmod(self):
+        out, status = oracle_output('print(-7.0 % 3.0)\nprint(7.0 % -3.0)\nprint(7.0 % 0.0)\n')
+        self.assertEqual(status, 0)
+        self.assertEqual(out, '-1.000000\n1.000000\nnan\n')
+
+    def test_float_division_by_zero_is_ieee(self):
+        out, status = oracle_output('print(7.0 / 0.0)\nprint(-7.0 / 0.0)\nprint(0.0 / 0.0)\n')
+        self.assertEqual(status, 0)
+        self.assertEqual(out, 'inf\n-inf\nnan\n')
+
     def test_bool_print_is_01(self):
         out, status = oracle_output('print(True)\nprint(False)\n')
         self.assertEqual(status, 0)

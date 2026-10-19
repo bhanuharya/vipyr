@@ -46,6 +46,35 @@ print(f())
         self.assertNotIn('undef', ir)
 
 
+class TestIntDivisionIsTotal(unittest.TestCase):
+    SRC = '''
+def f(a: int, b: int) -> int:
+    x = a
+    x /= b
+    return a / b + a % b + x
+print(f(7, 0))
+'''
+
+    def test_divisor_is_guarded(self):
+        # sdiv/srem are UB for a zero divisor or INT_MIN / -1, so every
+        # divisor must come from the guard's select, never straight from
+        # user data.
+        mod = llvm.parse_assembly(ir_text_for(self.SRC))
+        divs = 0
+        for fn in mod.functions:
+            for bb in fn.blocks:
+                for ins in bb.instructions:
+                    if ins.opcode in ('sdiv', 'srem'):
+                        divs += 1
+                        divisor = list(ins.operands)[1]
+                        self.assertTrue(str(divisor).strip().split(' = ')[1].startswith('select'),
+                                        f'unguarded divisor in: {ins}')
+        self.assertEqual(divs, 3)
+
+    def test_module_verifies(self):
+        llvm.parse_assembly(ir_text_for(self.SRC)).verify()
+
+
 class TestIRVerifies(unittest.TestCase):
     def test_verify_accepts(self):
         src = '''
