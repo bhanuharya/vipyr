@@ -83,8 +83,13 @@ python3.12 -m venv .venv                 # llvmlite 0.43 needs Python <= 3.12
 . .venv/bin/activate
 pip install -r requirements.txt          # llvmlite, ziglang
 python -m src.runner tests/standard.py   # compile to RISC-V, run under QEMU
+python -m src.runner tests/standard.py --count   # ...and count executed instructions
 ./run_regression_tests.sh                # full suite, including QEMU runs
 ```
+
+`--count` reports how many RISC-V instructions the program executed and in
+which functions. [docs/measuring.md](docs/measuring.md) explains how it works
+and has short exercises for reading the results.
 
 Without a glibc cross toolchain (`PYRV_CC` or
 `riscv32-unknown-linux-gnu-clang` on `PATH`), the runner links with Zig's
@@ -440,6 +445,13 @@ Compare optimization pipelines only after verifying:
 3. The executable was built for the same RISC-V ABI and target features.
 4. The instruction-count method is unchanged.
 5. Runtime measurements are repeated enough to overcome QEMU timing noise.
+
+Use the executed count of the program's own functions (`--count`, "your
+program") rather than a static count. Two caveats apply to the historical
+results in `hasil/`. The executables were linked from bitcode, which the C
+compiler recompiled at `-O0`, so they did not run `llc`'s optimized output.
+And `opt_build.py` counts every disassembly line of the whole static binary,
+which is mostly libc. See [docs/measuring.md](docs/measuring.md).
 
 The central research trade-off is not only code reduction. It is the relationship between:
 

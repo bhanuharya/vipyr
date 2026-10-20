@@ -14,6 +14,8 @@ Environment variable configuration:
                     riscv32-unknown-linux-gnu-clang)
     PYRV_SYSROOT    cross sysroot for --sysroot (default: /opt/riscv/sysroot)
     PYRV_QEMU_USER  qemu-riscv32 user-mode binary (default: qemu-riscv32)
+    PYRV_OBJDUMP    llvm-objdump, for --count's instruction mix
+                    (default: llvm-objdump-14, then llvm-objdump)
     PYRV_READLINE   path to readline.c helper (default: ./readline.c)
     PYRV_RUNTIME_LIB path to a runtime shared dir containing readline.c
                      (used when readline.c is not in the current dir)
@@ -25,7 +27,10 @@ ziglang`). That needs no sysroot and produces static rv32gc/ilp32d binaries.
 
 Command line:
 
-    python -m src.runner prog.py [--passes simplifycfg,instcombine]
+    python -m src.runner prog.py [--passes simplifycfg,instcombine] [--count]
+
+--count runs the program under QEMU's instruction trace and reports how many
+RISC-V instructions it executed, and where (see src/icount.py).
 """
 
 from __future__ import annotations
@@ -99,6 +104,10 @@ def sysroot_path() -> str:
 
 def qemu_user_path() -> str:
     return _which('qemu-riscv32', 'PYRV_QEMU_USER')
+
+
+def objdump_path() -> str:
+    return _which_any(['llvm-objdump-14', 'llvm-objdump'], 'PYRV_OBJDUMP')
 
 
 def readline_path() -> str:
@@ -266,6 +275,18 @@ def compile_program(src: str, out_dir: str, passes: str | None = None,
     }
 
 
+def qemu_command(exe: str, qemu_args: tuple[str, ...] = ()) -> list[str]:
+    """The qemu-riscv32 command line that runs `exe`."""
+    qemu = qemu_user_path()
+    _check_tool(qemu, 'qemu-riscv32')
+    sysroot = sysroot_path()
+    # -L lets QEMU find a glibc sysroot's dynamic loader. Static Zig/musl
+    # binaries don't need one, so skip it when there is no sysroot.
+    if os.path.isdir(sysroot):
+        qemu_args = ('-L', sysroot) + tuple(qemu_args)
+    return [qemu, *qemu_args, str(exe)]
+
+
 def run_qemu(exe: str, stdin: str | None = None, timeout: int = 120,
              max_output: int = 10 * 1024 * 1024) -> tuple[int, str, str]:
     """
@@ -274,12 +295,7 @@ def run_qemu(exe: str, stdin: str | None = None, timeout: int = 120,
     Returns (exit_code, stdout, stderr). The guest exit status is returned
     as-is (0 on success). Output beyond max_output bytes is truncated.
     """
-    qemu = qemu_user_path()
-    _check_tool(qemu, 'qemu-riscv32')
-    sysroot = sysroot_path()
-    # -L lets QEMU find a glibc sysroot's dynamic loader. Static Zig/musl
-    # binaries don't need one, so skip it when there is no sysroot.
-    cmd = [qemu, '-L', sysroot, str(exe)] if os.path.isdir(sysroot) else [qemu, str(exe)]
+    cmd = qemu_command(exe)
     try:
         proc = subprocess.run(
             cmd, input=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -320,15 +336,25 @@ def main(argv: list[str] | None = None) -> int:
                         help='emit runtime bounds checks for subscripts')
     parser.add_argument('--keep', metavar='DIR',
                         help='write the .ll/.s/.riscv artifacts to DIR')
+    parser.add_argument('--count', action='store_true',
+                        help='count executed instructions (report on stderr)')
     args = parser.parse_args(argv)
 
     out_dir = args.keep or tempfile.mkdtemp(prefix='pyrv-')
     try:
         arts = compile_program(args.src, out_dir, passes=args.passes or None,
                                bounds_check=args.bounds_check)
-        code, out, err = run_qemu(arts['exe'])
+        if args.count:
+            from src import icount
+            profile = icount.profile_program(arts)
+            code, out, err = profile.exit_code, profile.stdout, profile.stderr
+        else:
+            code, out, err = run_qemu(arts['exe'])
         sys.stdout.buffer.write(out)
         sys.stderr.buffer.write(err)
+        if args.count:
+            sys.stdout.flush()
+            print('\n' + icount.report(profile), file=sys.stderr)
         return code
     except ToolchainError as e:
         print(f'error: {e}', file=sys.stderr)
