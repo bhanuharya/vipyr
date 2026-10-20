@@ -200,7 +200,7 @@ def compile_program(src: str, out_dir: str, passes: str | None = None,
     Compile a .py source through IR -> opt -> llc -> link.
 
     Returns a dict mapping stage names to output file paths:
-        ir, opt_bc, asm, exe
+        ir, opt_bc, obj, asm, exe
     """
     src = str(src)
     out_dir = Path(out_dir)
@@ -209,6 +209,7 @@ def compile_program(src: str, out_dir: str, passes: str | None = None,
 
     ir = out_dir / f'{base}.ll'
     opt_bc = out_dir / f'{base}.opt.bc'
+    obj = out_dir / f'{base}.o'
     asm = out_dir / f'{base}.s'
     exe = out_dir / f'{base}.riscv'
 
@@ -238,16 +239,20 @@ def compile_program(src: str, out_dir: str, passes: str | None = None,
     if proc.returncode != 0:
         raise ToolchainError(f'opt -verify failed:\n{proc.stderr}')
 
-    # Codegen.
+    # Codegen. llc writes the object we link and, for reading, the same code
+    # as assembly. Linking the bitcode instead would let the C driver
+    # recompile it at -O0 and throw llc's output away.
     llc = llc_path()
     _check_tool(llc, 'llc')
-    proc = _run([llc, '-march=riscv32', '-mattr=' + LLC_MATTRS,
-                 str(opt_bc), '-o', str(asm)])
-    if proc.returncode != 0:
-        raise ToolchainError(f'llc failed:\n{proc.stderr}')
+    llc_cmd = [llc, '-march=riscv32', '-mattr=' + LLC_MATTRS,
+               '-target-abi=' + RISCV_MABI, str(opt_bc)]
+    for filetype, out in (('obj', obj), ('asm', asm)):
+        proc = _run(llc_cmd + ['-filetype=' + filetype, '-o', str(out)])
+        if proc.returncode != 0:
+            raise ToolchainError(f'llc failed:\n{proc.stderr}')
 
     # Link. Float `%` lowers to a call to fmod, hence -lm.
-    proc = _run(link_command() + [str(opt_bc), readline_path(),
+    proc = _run(link_command() + [str(obj), readline_path(),
                                   runtime_path(), '-lm', '-o', str(exe)])
     if proc.returncode != 0:
         raise ToolchainError(f'link failed:\n{proc.stderr}')
@@ -255,6 +260,7 @@ def compile_program(src: str, out_dir: str, passes: str | None = None,
     return {
         'ir': str(ir),
         'opt_bc': str(opt_bc),
+        'obj': str(obj),
         'asm': str(asm),
         'exe': str(exe),
     }

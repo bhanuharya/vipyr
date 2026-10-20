@@ -151,8 +151,10 @@ class LLVMBackend():
         strT = ir.ArrayType(ir.IntType(8), len(strBytes))
         strConstant = ir.Constant(strT, strBytes)
 
+        # A bare numeric name like "0" would print as `%hi(0)` in assembly,
+        # which an assembler reads as address zero.
         globalV = ir.GlobalVariable(
-            self.module, strT, str(self.globalCount))
+            self.module, strT, f'.str.{self.globalCount}')
         globalV.global_constant = True
         globalV.initializer = strConstant # type: ignore
         globalV.linkage = 'internal'

@@ -26,6 +26,15 @@ class TestTargetAndLayout(unittest.TestCase):
         self.assertIn('define i32 @"main"()', ir)
         self.assertIn('ret i32 0', ir)
 
+    def test_string_constants_have_symbolic_names(self):
+        # A global named "0" prints as `%hi(0)` in assembly, which an
+        # assembler reads as address zero.
+        mod = llvm.parse_assembly(ir_text_for('print("hi")\nprint(1)\n'))
+        names = [g.name for g in mod.global_variables]
+        self.assertTrue(names)
+        for name in names:
+            self.assertFalse(name[0].isdigit(), name)
+
 
 class TestNoUndef(unittest.TestCase):
     def test_bool_op_no_placeholder_block_crash(self):
