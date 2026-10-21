@@ -123,7 +123,8 @@ benchmarks to RISC-V and executes them under QEMU when the toolchain is
 available. The suite cross-checks QEMU output against the reference
 evaluator, and compares optimized vs. unoptimized binaries. Tool paths are
 resolved from `PYRV_OPT`, `PYRV_LLC`, `PYRV_CC`, `PYRV_SYSROOT`, and
-`PYRV_QEMU_USER` (see `src/runner.py`).
+`PYRV_QEMU_USER`; runtime source overrides are `PYRV_READLINE`,
+`PYRV_RUNTIME`, and `PYRV_RUNTIME_LIB` (see `src/runner.py`).
 
 To use a glibc toolchain instead of the Zig fallback, `PYRV_CC` must be a
 Linux RISC-V32 **cross-Clang** capable of consuming the generated LLVM IR. A bare RISC-V GCC cannot be used
