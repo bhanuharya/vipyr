@@ -3,11 +3,14 @@ import types
 from .constants import REGISTER_SIZE
 from .checked_nodes import *
 from .error import CompileError
-from .accel import CUSTOM_0
 from pathlib import Path
 
 import llvmlite.ir as ir
 import llvmlite.binding as llvm
+
+# The custom-0 major opcode, set aside by the RISC-V spec for custom
+# extensions. Accelerated functions compile to R-type instructions with it.
+CUSTOM_0 = 0x0B
 
 PRINT_IR = False
 #PRINT_IR = True
@@ -124,9 +127,10 @@ class LLVMBackend():
         # pyr_alloc_init is idempotent and cheap, so this is always safe.
         self.builder.call(pyr_alloc_init, [])
 
-        # Functions replaced by proven custom instructions (src/accel.py), as
-        # name -> (funct3, funct7). The runtime emulates each one when the
-        # CPU lacks it (stock QEMU does), from a table built in emitFile.
+        # Functions to compile to custom instructions (--accel), as
+        # name -> (funct3, funct7); see docs/custom-instructions.md. The
+        # runtime emulates each one when the CPU lacks it (stock QEMU does),
+        # from a table built in emitFile.
         self.accel = dict(accel or {})
         self.accelEntries: dict[str, ir.Function] = {}
         if self.accel:

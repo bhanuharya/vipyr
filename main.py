@@ -17,8 +17,8 @@ def main():
     parser.add_argument('--output', '-o', default='out.ll',
                         help='Output LLVM IR file (default: out.ll)')
     parser.add_argument('--accel', action='append', default=[], metavar='NAME:FUNCT3:FUNCT7',
-                        help='replace calls to function NAME with a custom-0 instruction; '
-                             'src.runner passes this only for a valid certificate')
+                        help='compile calls to function NAME to one custom-0 instruction '
+                             '(unchecked: see docs/custom-instructions.md)')
     parser.add_argument('--bounds-check', action='store_true', default=False,
                         help='Emit runtime bounds checks for list/string subscripts; '
                              'an out-of-range index prints an IndexError to stderr '

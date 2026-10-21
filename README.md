@@ -91,29 +91,19 @@ python -m src.runner tests/standard.py --count   # ...and count executed instruc
 which functions. [docs/measuring.md](docs/measuring.md) explains how it works
 and has short exercises for reading the results.
 
-### Checking AI-proposed instructions
+### Custom instructions
 
 ```bash
-python -m src.cage examples/cage/pid.py q15mul examples/cage/candidates/*.v
+python -m src.runner prog.py --accel q15mul:0:0 --count
 ```
 
-checks candidate circuits for a custom instruction that would replace
-`q15mul`, the hot function of a fixed-point PID controller. The answer key
-comes from the compiler's IR, never from whoever wrote the circuit, and a
-circuit is accepted only with the right interface, no state, and a Z3 proof
-that it matches for every input. The candidates include a backdoor, a time
-bomb and a subtle saturation bug; all are rejected. An accepted circuit gets
-a certificate, and with it the compiler turns every call into one custom
-instruction:
-
-```bash
-python -m src.cage examples/cage/pid.py q15mul examples/cage/candidates/honest.v \
-    --accept examples/cage/q15mul.cert.json
-python -m src.runner examples/cage/pid.py --accel examples/cage/q15mul.cert.json --count
-```
-
-The controller then executes 28% fewer instructions with identical output.
-See [docs/cage.md](docs/cage.md).
+compiles every call to the function `q15mul` to one custom RISC-V
+instruction (custom-0 opcode, funct3 0, funct7 0). Stock QEMU does not know
+the instruction, so the runtime emulates it in software, and `--count`
+counts it as one instruction. vipyr does not check that a circuit for the
+instruction computes the same thing as the function;
+[AEGIS-V](https://github.com/bhanuharya/aegis-v) does that, then calls vipyr.
+See [docs/custom-instructions.md](docs/custom-instructions.md).
 
 Without a glibc cross toolchain (`PYRV_CC` or
 `riscv32-unknown-linux-gnu-clang` on `PATH`), the runner links with Zig's

@@ -28,7 +28,7 @@ ziglang`). That needs no sysroot and produces static rv32gc/ilp32d binaries.
 Command line:
 
     python -m src.runner prog.py [--passes simplifycfg,instcombine] [--count]
-                                 [--accel CERT]
+                                 [--accel NAME:FUNCT3:FUNCT7]
 
 --count runs the program under QEMU's instruction trace and reports how many
 RISC-V instructions it executed, and where (see src/icount.py).
@@ -203,42 +203,21 @@ def check_toolchain():
             raise ToolchainError(f'sysroot not found: {sysroot_path()}')
 
 
-def accel_flags(src: str, certificates: list[str], out_dir: Path) -> list[str]:
-    """
-    Frontend flags for proven custom instructions.
+_ACCEL_RE = re.compile(r'[A-Za-z_]\w*:[0-7]:(?:[0-9]|[1-9][0-9]|1[01][0-9]|12[0-7])')
 
-    A certificate carries no trust of its own: it is an unsigned file, and
-    anyone could write one. So every build checks that the circuit it names
-    is the one it was issued for (by hash), recomputes the answer key from
-    the program being compiled, and puts the circuit through the cage again.
-    A certificate is refused unless all of that passes, so a function that
-    changed, a circuit that was edited, or a hand-written certificate for a
-    circuit that never passed cannot get an instruction into the program.
-    """
-    from src import accel, cage, spec
-    flags, keys = [], {}
-    for path in certificates:
-        cert = accel.Certificate.load(path)
-        if cert.key in keys:
-            raise ToolchainError(f'{path} and {keys[cert.key]} use the same encoding '
-                                 f'(funct3={cert.funct3}, funct7={cert.funct7})')
-        keys[cert.key] = path
-        circuit = Path(path).parent / cert.circuit
-        if not circuit.is_file() or accel.sha256_file(circuit) != cert.circuit_sha256:
-            raise ToolchainError(f'{path}: the circuit {circuit} is missing or modified '
-                                 f'since the certificate was issued')
-        try:
-            key = spec.from_program(src, cert.function, str(out_dir / f'spec-{cert.function}'))
-        except spec.SpecError as e:
-            raise ToolchainError(f'{path}: {e}')
-        verdict = cage.judge(str(circuit), key)
-        if not verdict.accepted:
-            failed = '; '.join(c.detail for c in verdict.checks if not c.passed)
-            changed = (' (the function has changed since the certificate was issued)'
-                       if accel.sha256_text(key.ir) != cert.answer_key_sha256 else '')
-            raise ToolchainError(f'{path}: the circuit does not pass the cage for the current '
-                                 f'{cert.function}{changed}: {failed}')
-        flags += ['--accel', f'{cert.function}:{cert.funct3}:{cert.funct7}']
+
+def accel_flags(accel: list[str]) -> list[str]:
+    """Frontend flags for NAME:FUNCT3:FUNCT7 custom-instruction requests."""
+    flags, seen = [], {}
+    for item in accel:
+        if not _ACCEL_RE.fullmatch(item):
+            raise ToolchainError(f'--accel {item}: expected NAME:FUNCT3:FUNCT7 with '
+                                 f'funct3 0-7 and funct7 0-127')
+        encoding = item.split(':', 1)[1]
+        if encoding in seen:
+            raise ToolchainError(f'--accel {item} and {seen[encoding]} use the same encoding')
+        seen[encoding] = item
+        flags += ['--accel', item]
     return flags
 
 
@@ -249,8 +228,10 @@ def compile_program(src: str, out_dir: str, passes: str | None = None,
     """
     Compile a .py source through IR -> opt -> llc -> link.
 
-    `accel` lists certificates (src/accel.py) for functions to replace with
-    proven custom instructions.
+    `accel` lists NAME:FUNCT3:FUNCT7 requests: calls to function NAME become
+    one custom-0 instruction with that encoding (docs/custom-instructions.md).
+    The compiler does not check that the instruction computes the same thing
+    as the function; that is the job of a separate checker, such as AEGIS-V.
 
     Returns a dict mapping stage names to output file paths:
         ir, opt_bc, obj, asm, exe
@@ -273,7 +254,7 @@ def compile_program(src: str, out_dir: str, passes: str | None = None,
     if bounds_check:
         frontend_cmd.append('--bounds-check')
     if accel:
-        frontend_cmd += accel_flags(src, accel, out_dir)
+        frontend_cmd += accel_flags(accel)
     proc = _run(frontend_cmd)
     if proc.returncode != 0:
         raise ToolchainError(f'frontend failed:\n{proc.stderr}')
@@ -384,9 +365,9 @@ def main(argv: list[str] | None = None) -> int:
                         help='write the .ll/.s/.riscv artifacts to DIR')
     parser.add_argument('--count', action='store_true',
                         help='count executed instructions (report on stderr)')
-    parser.add_argument('--accel', action='append', metavar='CERT',
-                        help='use the proven custom instruction in certificate CERT '
-                             '(written by python -m src.cage --accept)')
+    parser.add_argument('--accel', action='append', metavar='NAME:FUNCT3:FUNCT7',
+                        help='compile calls to function NAME to one custom-0 instruction '
+                             '(unchecked: see docs/custom-instructions.md)')
     args = parser.parse_args(argv)
 
     out_dir = args.keep or tempfile.mkdtemp(prefix='pyrv-')

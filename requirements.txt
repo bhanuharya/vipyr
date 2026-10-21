@@ -2,7 +2,3 @@ llvmlite==0.43.0
 # Links RISC-V executables (bundled clang + musl) when no glibc cross
 # toolchain is configured; see src/runner.py.
 ziglang==0.17.0
-# The cage (src/cage.py): Z3 proves candidate circuits equal to the answer
-# key, and Yosys (as sandboxed WebAssembly) reads their Verilog.
-z3-solver==5.3.1.0
-yowasp-yosys==0.70.0.0.post1259
