@@ -362,6 +362,7 @@ The test suite is organized from small language checks to heavier workloads:
 
 ```text
 tests/basic_type_prints.py
+tests/arithmatic.py
 tests/variables.py
 tests/math_ops.py
 tests/flow_control.py
