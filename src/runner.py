@@ -205,12 +205,15 @@ def check_toolchain():
 
 def accel_flags(src: str, certificates: list[str], out_dir: Path) -> list[str]:
     """
-    Frontend flags for proven custom instructions, after checking each
-    certificate against the program being compiled. Its answer key is
-    recomputed from the source. If that differs from the one the circuit was
-    proved against (the function changed, or another LLVM version prints it
-    differently), the circuit named by the certificate is put through the
-    cage again, and the certificate is refused unless it passes.
+    Frontend flags for proven custom instructions.
+
+    A certificate carries no trust of its own: it is an unsigned file, and
+    anyone could write one. So every build checks that the circuit it names
+    is the one it was issued for (by hash), recomputes the answer key from
+    the program being compiled, and puts the circuit through the cage again.
+    A certificate is refused unless all of that passes, so a function that
+    changed, a circuit that was edited, or a hand-written certificate for a
+    circuit that never passed cannot get an instruction into the program.
     """
     from src import accel, cage, spec
     flags, keys = [], {}
@@ -220,20 +223,21 @@ def accel_flags(src: str, certificates: list[str], out_dir: Path) -> list[str]:
             raise ToolchainError(f'{path} and {keys[cert.key]} use the same encoding '
                                  f'(funct3={cert.funct3}, funct7={cert.funct7})')
         keys[cert.key] = path
+        circuit = Path(path).parent / cert.circuit
+        if not circuit.is_file() or accel.sha256_file(circuit) != cert.circuit_sha256:
+            raise ToolchainError(f'{path}: the circuit {circuit} is missing or modified '
+                                 f'since the certificate was issued')
         try:
             key = spec.from_program(src, cert.function, str(out_dir / f'spec-{cert.function}'))
         except spec.SpecError as e:
             raise ToolchainError(f'{path}: {e}')
-        if accel.sha256_text(key.ir) != cert.answer_key_sha256:
-            circuit = Path(path).parent / cert.circuit
-            if not circuit.is_file() or accel.sha256_file(circuit) != cert.circuit_sha256:
-                raise ToolchainError(f'{path}: {cert.function} has changed since its circuit was '
-                                     f'proved, and the circuit {circuit} is missing or modified')
-            verdict = cage.judge(str(circuit), key)
-            if not verdict.accepted:
-                failed = '; '.join(c.detail for c in verdict.checks if not c.passed)
-                raise ToolchainError(f'{path}: {cert.function} has changed since its circuit was '
-                                     f'proved, and the circuit no longer matches it: {failed}')
+        verdict = cage.judge(str(circuit), key)
+        if not verdict.accepted:
+            failed = '; '.join(c.detail for c in verdict.checks if not c.passed)
+            changed = (' (the function has changed since the certificate was issued)'
+                       if accel.sha256_text(key.ir) != cert.answer_key_sha256 else '')
+            raise ToolchainError(f'{path}: the circuit does not pass the cage for the current '
+                                 f'{cert.function}{changed}: {failed}')
         flags += ['--accel', f'{cert.function}:{cert.funct3}:{cert.funct7}']
     return flags
 

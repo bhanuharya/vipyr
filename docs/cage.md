@@ -97,17 +97,21 @@ python -m src.runner examples/cage/pid.py --accel examples/cage/q15mul.cert.json
 
 The certificate names the function, the instruction encoding (custom-0
 opcode, funct3, funct7), the circuit (path and hash) and a hash of the answer
-key it was proved against. `--accel` recomputes the answer key from the
-program being compiled. If it differs, because the function changed or
-another LLVM version prints it differently, the circuit goes through the
-cage again, and the certificate is refused unless it still passes. A proof
-never outlives the code it was about.
+key it was proved against. It binds those files together, but it is not
+evidence that a proof happened: it is an unsigned file anyone could write.
+So `--accel` trusts none of it. On every build it checks the circuit's hash,
+recomputes the answer key from the program being compiled, and runs the cage
+again, which takes a few seconds. A certificate is refused if the function
+changed, if the circuit was edited, or if the circuit never passed in the
+first place.
 
 Calls to the function then compile to one instruction,
 `.insn r 11, 0, 0, rd, rs1, rs2`, marked free of side effects so LLVM can
 still move or merge it. Stock QEMU does not know the instruction, so the
 runtime emulates it: a SIGILL handler decodes it, calls a software copy of
-the function, writes `rd` and resumes. `--count` counts each custom
+the function, writes `rd` and resumes. That run exercises the software copy,
+not the circuit; that the circuit computes the same results is what the
+equivalence proof establishes, separately. `--count` counts each custom
 instruction once, as a CPU that has it would, and reports the emulation
 separately:
 
@@ -118,8 +122,10 @@ separately:
 | Output | identical | identical |
 
 That is 28% fewer executed instructions for the whole controller. Executed
-instructions are not cycles: the next measurements are cycles on a real core
-and the circuit's area and delay from synthesis.
+instructions are not cycles, and the controller's simulated joint advances
+once per loop iteration, so fewer instructions do not yet show better control
+or fewer missed deadlines. That needs cycles on a real core, the circuit's
+area and delay from synthesis, and a plant model with physical time.
 
 ## What is trusted, and what is not covered
 

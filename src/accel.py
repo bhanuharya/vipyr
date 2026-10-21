@@ -3,12 +3,16 @@ Certificates that let the compiler use a proven custom instruction.
 
 When the cage (src/cage.py) accepts a circuit for a function, it writes a
 certificate: which function, which instruction encoding, which circuit (by
-path, relative to the certificate, and hash), and a hash of the exact answer
-key the circuit was proved against. The compiler replaces calls to the
-function with the instruction only after recomputing the answer key from the
-program it is compiling. If the hash differs, because the function changed
-or another LLVM version prints it differently, the compiler puts the circuit
-through the cage again and refuses the certificate unless it still passes.
+path, relative to the certificate, and hash), and a hash of the answer key
+the circuit was proved against.
+
+A certificate binds these artifacts together; it is not evidence that the
+proof happened, since it is an unsigned file anyone could write. So the
+compiler trusts none of it: on every build it checks the circuit's hash,
+recomputes the answer key from the program it is compiling, and runs the
+cage again (src/runner.py, accel_flags). The answer-key hash only explains a
+failure: it tells whether the function changed since the certificate was
+issued.
 
 Instructions use the custom-0 major opcode (0x0B), set aside by the RISC-V
 spec for custom extensions, in R-type format:

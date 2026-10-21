@@ -255,7 +255,7 @@ class TestCertifiedInstruction(unittest.TestCase):
         changed.write_text(PID.read_text().replace('(p + 16384) >> 15', '(p + 16383) >> 15'))
         with self.assertRaises(runner.ToolchainError) as cm:
             self.build(changed, [self.cert], name='changed-build')
-        self.assertIn('no longer matches', str(cm.exception))
+        self.assertIn('function has changed', str(cm.exception))
 
     def test_answer_key_printed_differently_is_proved_again(self):
         # As if another LLVM version printed the same function differently.
@@ -263,11 +263,25 @@ class TestCertifiedInstruction(unittest.TestCase):
         self.assertTrue(Path(self.build(certs=[cert], name='reprove')['exe']).exists())
 
     def test_modified_circuit_is_refused(self):
-        cert = self.tampered('modified.cert.json', answer_key_sha256='0' * 64,
-                             circuit_sha256='0' * 64)
+        # The answer key still matches; the circuit file does not.
+        edited = self.tmp / 'edited' / 'honest.v'
+        edited.parent.mkdir()
+        edited.write_text((CANDIDATES / 'honest.v').read_text() + '// edited\n')
+        cert = self.tampered('edited/edited.cert.json', circuit='honest.v')
         with self.assertRaises(runner.ToolchainError) as cm:
             self.build(certs=[cert], name='modified')
         self.assertIn('missing or modified', str(cm.exception))
+
+    def test_forged_certificate_is_refused(self):
+        # A hand-written certificate for the backdoor, with correct hashes:
+        # hashes bind files, they do not show that a proof happened.
+        cert = self.tampered('forged.cert.json',
+                             circuit=str(CANDIDATES / 'backdoor.v'),
+                             circuit_sha256=accel.sha256_file(CANDIDATES / 'backdoor.v'))
+        with self.assertRaises(runner.ToolchainError) as cm:
+            self.build(certs=[cert], name='forged')
+        self.assertIn('does not pass the cage', str(cm.exception))
+        self.assertIn('0x00001337', str(cm.exception))
 
     def test_one_encoding_per_instruction(self):
         with self.assertRaises(runner.ToolchainError) as cm:
