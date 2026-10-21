@@ -28,6 +28,7 @@ ziglang`). That needs no sysroot and produces static rv32gc/ilp32d binaries.
 Command line:
 
     python -m src.runner prog.py [--passes simplifycfg,instcombine] [--count]
+                                 [--accel CERT]
 
 --count runs the program under QEMU's instruction trace and reports how many
 RISC-V instructions it executed, and where (see src/icount.py).
@@ -202,11 +203,50 @@ def check_toolchain():
             raise ToolchainError(f'sysroot not found: {sysroot_path()}')
 
 
+def accel_flags(src: str, certificates: list[str], out_dir: Path) -> list[str]:
+    """
+    Frontend flags for proven custom instructions, after checking each
+    certificate against the program being compiled. Its answer key is
+    recomputed from the source. If that differs from the one the circuit was
+    proved against (the function changed, or another LLVM version prints it
+    differently), the circuit named by the certificate is put through the
+    cage again, and the certificate is refused unless it passes.
+    """
+    from src import accel, cage, spec
+    flags, keys = [], {}
+    for path in certificates:
+        cert = accel.Certificate.load(path)
+        if cert.key in keys:
+            raise ToolchainError(f'{path} and {keys[cert.key]} use the same encoding '
+                                 f'(funct3={cert.funct3}, funct7={cert.funct7})')
+        keys[cert.key] = path
+        try:
+            key = spec.from_program(src, cert.function, str(out_dir / f'spec-{cert.function}'))
+        except spec.SpecError as e:
+            raise ToolchainError(f'{path}: {e}')
+        if accel.sha256_text(key.ir) != cert.answer_key_sha256:
+            circuit = Path(path).parent / cert.circuit
+            if not circuit.is_file() or accel.sha256_file(circuit) != cert.circuit_sha256:
+                raise ToolchainError(f'{path}: {cert.function} has changed since its circuit was '
+                                     f'proved, and the circuit {circuit} is missing or modified')
+            verdict = cage.judge(str(circuit), key)
+            if not verdict.accepted:
+                failed = '; '.join(c.detail for c in verdict.checks if not c.passed)
+                raise ToolchainError(f'{path}: {cert.function} has changed since its circuit was '
+                                     f'proved, and the circuit no longer matches it: {failed}')
+        flags += ['--accel', f'{cert.function}:{cert.funct3}:{cert.funct7}']
+    return flags
+
+
 def compile_program(src: str, out_dir: str, passes: str | None = None,
                     name: str | None = None,
-                    bounds_check: bool = False) -> dict[str, str]:
+                    bounds_check: bool = False,
+                    accel: list[str] | None = None) -> dict[str, str]:
     """
     Compile a .py source through IR -> opt -> llc -> link.
+
+    `accel` lists certificates (src/accel.py) for functions to replace with
+    proven custom instructions.
 
     Returns a dict mapping stage names to output file paths:
         ir, opt_bc, obj, asm, exe
@@ -228,6 +268,8 @@ def compile_program(src: str, out_dir: str, passes: str | None = None,
     frontend_cmd = [os.sys.executable, str(frontend), src, '-o', str(ir)]
     if bounds_check:
         frontend_cmd.append('--bounds-check')
+    if accel:
+        frontend_cmd += accel_flags(src, accel, out_dir)
     proc = _run(frontend_cmd)
     if proc.returncode != 0:
         raise ToolchainError(f'frontend failed:\n{proc.stderr}')
@@ -338,12 +380,15 @@ def main(argv: list[str] | None = None) -> int:
                         help='write the .ll/.s/.riscv artifacts to DIR')
     parser.add_argument('--count', action='store_true',
                         help='count executed instructions (report on stderr)')
+    parser.add_argument('--accel', action='append', metavar='CERT',
+                        help='use the proven custom instruction in certificate CERT '
+                             '(written by python -m src.cage --accept)')
     args = parser.parse_args(argv)
 
     out_dir = args.keep or tempfile.mkdtemp(prefix='pyrv-')
     try:
         arts = compile_program(args.src, out_dir, passes=args.passes or None,
-                               bounds_check=args.bounds_check)
+                               bounds_check=args.bounds_check, accel=args.accel)
         if args.count:
             from src import icount
             profile = icount.profile_program(arts)

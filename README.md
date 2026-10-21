@@ -102,8 +102,18 @@ checks candidate circuits for a custom instruction that would replace
 comes from the compiler's IR, never from whoever wrote the circuit, and a
 circuit is accepted only with the right interface, no memory, and a Z3 proof
 that it matches for every input. The candidates include a backdoor, a time
-bomb and a subtle saturation bug; all are rejected. See
-[docs/cage.md](docs/cage.md).
+bomb and a subtle saturation bug; all are rejected. An accepted circuit gets
+a certificate, and with it the compiler turns every call into one custom
+instruction:
+
+```bash
+python -m src.cage examples/cage/pid.py q15mul examples/cage/candidates/honest.v \
+    --accept examples/cage/q15mul.cert.json
+python -m src.runner examples/cage/pid.py --accel examples/cage/q15mul.cert.json --count
+```
+
+The controller then executes 28% fewer instructions with identical output.
+See [docs/cage.md](docs/cage.md).
 
 Without a glibc cross toolchain (`PYRV_CC` or
 `riscv32-unknown-linux-gnu-clang` on `PATH`), the runner links with Zig's

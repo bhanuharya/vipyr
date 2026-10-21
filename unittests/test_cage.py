@@ -4,6 +4,9 @@ These need Z3, Yosys (pip install yowasp-yosys) and the RISC-V toolchain,
 and are skipped without them.
 """
 
+import contextlib
+import io
+import json
 import random
 import shutil
 import tempfile
@@ -12,9 +15,11 @@ from pathlib import Path
 
 from unittests.helpers import oracle_output, toolchain_available
 
+from src import runner
+
 try:
     import z3  # noqa: F401
-    from src import cage, spec
+    from src import accel, cage, icount, spec
     cage.yosys_path()
     HAVE_TOOLS = toolchain_available()
 except (ImportError, FileNotFoundError):
@@ -186,6 +191,88 @@ class TestCage(unittest.TestCase):
         verdict = cage.judge(str(path), self.key)
         self.assertFalse(verdict.accepted)
         self.assertIn('Yosys rejected', verdict.checks[0].detail)
+
+
+
+@unittest.skipUnless(HAVE_TOOLS, 'Z3, Yosys or the RISC-V toolchain not available')
+class TestCertifiedInstruction(unittest.TestCase):
+    """Using an accepted circuit: certificates, codegen, emulation, counts."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = Path(tempfile.mkdtemp(prefix='pyrv-accel-'))
+        cls.cert = cls.tmp / 'q15mul.cert.json'
+        assert cls.cage(CANDIDATES / 'honest.v', cls.cert) == 0
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    @staticmethod
+    def cage(candidate, cert):
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            return cage.main([str(PID), 'q15mul', str(candidate), '--accept', str(cert)])
+
+    def build(self, src=PID, certs=(), name='plain'):
+        return runner.compile_program(str(src), str(self.tmp / name),
+                                      passes=runner.DEFAULT_PASSES, accel=[str(c) for c in certs])
+
+    def tampered(self, name, **changes):
+        data = json.loads(self.cert.read_text())
+        data.update(changes)
+        path = self.tmp / name
+        path.write_text(json.dumps(data))
+        return path
+
+    def test_rejected_circuit_gets_no_certificate(self):
+        cert = self.tmp / 'backdoor.cert.json'
+        self.assertEqual(self.cage(CANDIDATES / 'backdoor.v', cert), 1)
+        self.assertFalse(cert.exists())
+
+    def test_certificate_names_the_proved_circuit(self):
+        cert = accel.Certificate.load(self.cert)
+        self.assertEqual((cert.function, cert.funct3, cert.funct7), ('q15mul', 0, 0))
+        circuit = self.cert.parent / cert.circuit
+        self.assertEqual(accel.sha256_file(circuit), accel.sha256_file(CANDIDATES / 'honest.v'))
+
+    def test_accelerated_program_matches_and_runs_fewer_instructions(self):
+        plain = self.build()
+        fast = self.build(certs=[self.cert], name='fast')
+        self.assertIn('.insn r 11, 0, 0', Path(fast['asm']).read_text())
+        self.assertEqual(runner.run_qemu(fast['exe'])[:2], runner.run_qemu(plain['exe'])[:2])
+
+        before, after = icount.profile_program(plain), icount.profile_program(fast)
+        # Three calls per control step, 2000 steps.
+        self.assertEqual(after.custom_instructions, 6000)
+        self.assertEqual(after.by_function().get('pid.q15mul', 0), 0)
+        self.assertGreater(after.emulation, 0)
+        self.assertNotIn('pyr_emul.pid.q15mul', after.program_functions)
+        self.assertLess(after.program, 0.8 * before.program)
+
+    def test_changed_function_is_refused(self):
+        changed = self.tmp / 'changed' / 'pid.py'
+        changed.parent.mkdir()
+        changed.write_text(PID.read_text().replace('(p + 16384) >> 15', '(p + 16383) >> 15'))
+        with self.assertRaises(runner.ToolchainError) as cm:
+            self.build(changed, [self.cert], name='changed-build')
+        self.assertIn('no longer matches', str(cm.exception))
+
+    def test_answer_key_printed_differently_is_proved_again(self):
+        # As if another LLVM version printed the same function differently.
+        cert = self.tampered('reprove.cert.json', answer_key_sha256='0' * 64)
+        self.assertTrue(Path(self.build(certs=[cert], name='reprove')['exe']).exists())
+
+    def test_modified_circuit_is_refused(self):
+        cert = self.tampered('modified.cert.json', answer_key_sha256='0' * 64,
+                             circuit_sha256='0' * 64)
+        with self.assertRaises(runner.ToolchainError) as cm:
+            self.build(certs=[cert], name='modified')
+        self.assertIn('missing or modified', str(cm.exception))
+
+    def test_one_encoding_per_instruction(self):
+        with self.assertRaises(runner.ToolchainError) as cm:
+            self.build(certs=[self.cert, self.cert], name='twice')
+        self.assertIn('same encoding', str(cm.exception))
 
 
 if __name__ == '__main__':

@@ -1,0 +1,8 @@
+{
+  "function": "q15mul",
+  "funct3": 0,
+  "funct7": 0,
+  "answer_key_sha256": "08cf56f23b9ffd38648e4947a61f774ec854ee4146ee69eec0be358ab5db5d37",
+  "circuit_sha256": "d3ff83949195e791f119abf970a8ed40daea184f8c0d04cf2ffc1ef872b604fb",
+  "circuit": "candidates/honest.v"
+}

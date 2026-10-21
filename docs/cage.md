@@ -75,19 +75,56 @@ The translator is part of the trusted base, so `unittests/test_cage.py`
 checks it against the independent reference evaluator on every operation it
 supports.
 
+## Using an accepted instruction
+
+`--accept` writes a certificate for an accepted circuit; nothing else does:
+
+```bash
+python -m src.cage examples/cage/pid.py q15mul examples/cage/candidates/honest.v \
+    --accept examples/cage/q15mul.cert.json
+python -m src.runner examples/cage/pid.py --accel examples/cage/q15mul.cert.json --count
+```
+
+The certificate names the function, the instruction encoding (custom-0
+opcode, funct3, funct7), the circuit (path and hash) and a hash of the answer
+key it was proved against. `--accel` recomputes the answer key from the
+program being compiled. If it differs, because the function changed or
+another LLVM version prints it differently, the circuit goes through the
+cage again, and the certificate is refused unless it still passes. A proof
+never outlives the code it was about.
+
+Calls to the function then compile to one instruction,
+`.insn r 11, 0, 0, rd, rs1, rs2`, marked free of side effects so LLVM can
+still move or merge it. Stock QEMU does not know the instruction, so the
+runtime emulates it: a SIGILL handler decodes it, calls a software copy of
+the function, writes `rd` and resumes. `--count` counts each custom
+instruction once, as a CPU that has it would, and reports the emulation
+separately:
+
+| PID controller, 2000 steps | Without | With the certified instruction |
+| --- | ---: | ---: |
+| Instructions in the program | 372,274 | 266,279 (6,000 of them custom) |
+| In `q15mul` and its caller `control` | 166,000 | 60,000 |
+| Output | identical | identical |
+
+That is 28% fewer executed instructions for the whole controller. Executed
+instructions are not cycles: the next measurements are cycles on a real core
+and the circuit's area and delay from synthesis.
+
 ## What is trusted, and what is not covered
 
 The guarantee rests on these tools being correct: LLVM's `opt`, the IR
 translator in `src/spec.py`, Yosys (which reads the Verilog), and Z3 (which
-does the proof). The agent's output is not among them.
+does the proof). When an instruction is used, the trusted base also includes
+the compiler's replacement of each call (`doCustomInstruction` in
+`src/llvm.py`) and, under QEMU, the emulation handler in `runtime.c`. The
+agent's output is not among them.
 
 Not covered yet:
 
 - **Integration into a core.** The plan is to place accepted circuits behind
   a fixed coprocessor port (CV-X-IF on an open core such as CV32E40X) that is
   checked once by people, so the agent never edits the processor itself.
-- **The compiler using the instruction.** The next step is to replace calls
-  to the function with the instruction and measure the change with `--count`.
 - **Physical side channels**, such as power draw. A circuit with no memory
   and a fixed latency has no timing channel of its own, but power analysis
   is out of scope.

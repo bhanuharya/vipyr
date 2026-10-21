@@ -3,6 +3,7 @@ import types
 from .constants import REGISTER_SIZE
 from .checked_nodes import *
 from .error import CompileError
+from .accel import CUSTOM_0
 from pathlib import Path
 
 import llvmlite.ir as ir
@@ -25,7 +26,8 @@ class LLVMBackend():
     symbols: list[dict[str, LLVMSymbol]]
     target_machine: llvm.TargetMachine
     triple: str
-    def __init__(self, fileName: str, outFile: str = 'out.ll', boundsCheck: bool = False):
+    def __init__(self, fileName: str, outFile: str = 'out.ll', boundsCheck: bool = False,
+                 accel: dict[str, tuple[int, int]] | None = None):
         self.outFile = outFile
         # When enabled every list/string subscript emits a runtime bounds
         # check (pyr_bounds_check) before the element access.
@@ -122,8 +124,36 @@ class LLVMBackend():
         # pyr_alloc_init is idempotent and cheap, so this is always safe.
         self.builder.call(pyr_alloc_init, [])
 
+        # Functions replaced by proven custom instructions (src/accel.py), as
+        # name -> (funct3, funct7). The runtime emulates each one when the
+        # CPU lacks it (stock QEMU does), from a table built in emitFile.
+        self.accel = dict(accel or {})
+        self.accelEntries: dict[str, ir.Function] = {}
+        if self.accel:
+            entryT = ir.LiteralStructType([ir.IntType(32), voidPtr])
+            self.accelTable = ir.GlobalVariable(
+                self.module, ir.ArrayType(entryT, len(self.accel)), 'pyr_accel_table')
+            self.accelTable.global_constant = True
+            self.accelTable.linkage = 'internal'
+            pyr_accel_init = ir.Function(self.module, ir.FunctionType(ir.VoidType(), [
+                voidPtr, ir.IntType(32)]), 'pyr_accel_init')
+            self.builder.call(pyr_accel_init, [
+                self.builder.bitcast(self.accelTable, voidPtr),
+                ir.Constant(ir.IntType(32), len(self.accel))])
+
     def emitFile(self):
         self.builder.ret(self.getConstant(0, 32))
+        if self.accel:
+            missing = sorted(set(self.accel) - set(self.accelEntries))
+            if missing:
+                raise CompileError(f'--accel names functions that are not defined: {", ".join(missing)}')
+            entryT = self.accelTable.type.pointee.element
+            entries = []
+            for name in sorted(self.accel):
+                funct3, funct7 = self.accel[name]
+                fnPtr = self.accelEntries[name].bitcast(entryT.elements[1])
+                entries.append(ir.Constant(entryT, [ir.Constant(ir.IntType(32), funct7 << 3 | funct3), fnPtr]))
+            self.accelTable.initializer = ir.Constant(self.accelTable.type.pointee, entries)
         llvm_ir = str(self.module)
 
         if PRINT_IR:
@@ -601,9 +631,14 @@ class LLVMBackend():
         base = node.base
 
         fn = ir.Function(module=self.module, ftype=node.t.toLLVM(), name=self.makeFnName(base.name))
-        entry = fn.append_basic_block('entry')
-
         self.symbols[-1][self.makeFnName(base.name)] = LLVMSymbol(node.t, fn)
+        self.emitFunctionBody(node, fn)
+        if base.name in self.accel:
+            self.emitEmulation(node, base.name)
+        return fn
+
+    def emitFunctionBody(self, node: CheckedFnDefNode, fn: ir.Function):
+        entry = fn.append_basic_block('entry')
         self.symbols.append(dict())
 
         was_fn = self.fn
@@ -641,7 +676,46 @@ class LLVMBackend():
         self.fn = was_fn
         self.builder = was_builder
 
-        return fn
+    def emitEmulation(self, node: CheckedFnDefNode, name: str):
+        """
+        A software copy of an accelerated function, for CPUs without the
+        instruction. `pyr_emul.<fn>` takes and returns whole registers, as
+        the instruction does; it calls a clone of the body so that executed-
+        instruction counts can tell emulation apart from the program.
+        """
+        fnT = node.t.asCallable()
+        types = fnT.args + [fnT.returnType]
+        if not (1 <= len(fnT.args) <= 2 and all(t.isInteger() or t.isBool() for t in types)):
+            raise CompileError(f'--accel {name}: an instruction takes one or two integers and returns one')
+        body = ir.Function(self.module, node.t.toLLVM(), name=f'pyr_emul.body.{self.makeFnName(name)}')
+        self.emitFunctionBody(node, body)
+        reg = ir.IntType(32)
+        wrapper = ir.Function(self.module, ir.FunctionType(reg, [reg, reg]), name=f'pyr_emul.{self.makeFnName(name)}')
+        builder = ir.IRBuilder(wrapper.append_basic_block('entry'))
+        args = [builder.trunc(a, t.toLLVM()) if t.toLLVM().width < 32 else a
+                for a, t in zip(wrapper.args, fnT.args)]
+        builder.ret(self.toRegister(builder, builder.call(body, args), fnT.returnType))
+        self.accelEntries[name] = wrapper
+
+    def toRegister(self, builder: ir.IRBuilder, val: ir.Value, t: Class) -> ir.Value:
+        """Widen an integer or bool to a 32-bit register, as the ABI does."""
+        reg = ir.IntType(32)
+        if val.type.width == 32:
+            return val
+        return builder.zext(val, reg) if t.isBool() else builder.sext(val, reg)
+
+    def doCustomInstruction(self, name: str, args: list[ir.Value], fnT: FnType) -> ir.Value:
+        """A call to an accelerated function, as one custom-0 instruction."""
+        funct3, funct7 = self.accel[name]
+        reg = ir.IntType(32)
+        regs = [self.toRegister(self.builder, a, t) for a, t in zip(args, fnT.args)]
+        regs += [ir.Constant(reg, 0)] * (2 - len(regs))
+        # No side effects: like an add, LLVM may move, merge or drop it.
+        result = self.builder.asm(ir.FunctionType(reg, [reg, reg]),
+                                  f'.insn r {CUSTOM_0}, {funct3}, {funct7}, $0, $1, $2',
+                                  '=r,r,r', regs, False, name=name)
+        retT = fnT.returnType.toLLVM()
+        return self.builder.trunc(result, retT) if retT.width < 32 else result
     
     def evalFor(self, node: CheckedForNode):
         self.symbols.append(dict())
@@ -1173,7 +1247,9 @@ class LLVMBackend():
         args = []
         for arg in node.args:
             args.append(self.evalNode(arg, False))
-        
+
+        if isinstance(node.operand.base, ast.Name) and node.operand.base.id in self.accel:
+            return self.doCustomInstruction(node.operand.base.id, args, node.fnType.asCallable())
         return self.builder.call(operand, args)
 
     def makeStringFromPointer(self, ptr: ir.Value, count: ir.Value | int, llvmT: ir.Type) -> ir.Value:

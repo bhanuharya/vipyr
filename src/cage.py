@@ -22,12 +22,17 @@ free variables, so a circuit cannot pass by leaving its output unspecified.
 Command line:
 
     python -m src.cage examples/cage/pid.py q15mul examples/cage/candidates/*.v
+    python -m src.cage examples/cage/pid.py q15mul honest.v --accept q15mul.cert.json
+
+--accept writes a certificate (src/accel.py) that the compiler requires
+before it replaces the function with the instruction.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -37,7 +42,7 @@ from pathlib import Path
 
 import z3
 
-from src import spec as specs
+from src import accel, spec as specs
 
 TOP = 'accel'
 PORTS = {'a': ('input', 32), 'b': ('input', 32), 'result': ('output', 32)}
@@ -237,7 +242,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument('function', help='function the custom instruction replaces')
     parser.add_argument('candidates', nargs='+', help='candidate Verilog files')
     parser.add_argument('--top', default=TOP, help=f'top module name (default: {TOP})')
+    parser.add_argument('--accept', metavar='CERT',
+                        help='for a single accepted candidate, write a certificate the '
+                             'compiler needs to use it (python -m src.runner --accel CERT)')
+    parser.add_argument('--funct3', type=int, default=0, help='instruction funct3 (default: 0)')
+    parser.add_argument('--funct7', type=int, default=0, help='instruction funct7 (default: 0)')
     args = parser.parse_args(argv)
+    if args.accept and len(args.candidates) != 1:
+        parser.error('--accept takes exactly one candidate')
 
     with tempfile.TemporaryDirectory(prefix='cage-spec-') as tmp:
         spec = specs.from_program(args.program, args.function, tmp)
@@ -249,6 +261,17 @@ def main(argv: list[str] | None = None) -> int:
         accepted += verdict.accepted
         print(report(verdict) + '\n')
     print(f'{accepted} of {len(args.candidates)} accepted')
+    if args.accept:
+        if not accepted:
+            print(f'no certificate written: {args.candidates[0]} was rejected', file=sys.stderr)
+            return 1
+        # The circuit path is stored relative to the certificate, so the pair
+        # can move together.
+        circuit = os.path.relpath(args.candidates[0], Path(args.accept).resolve().parent)
+        accel.Certificate(args.function, args.funct3, args.funct7,
+                          accel.sha256_text(spec.ir), accel.sha256_file(args.candidates[0]),
+                          circuit).save(args.accept)
+        print(f'certificate written to {args.accept}')
     return 0
 
 

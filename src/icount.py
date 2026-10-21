@@ -20,6 +20,13 @@ never lands on disk. Counting runs about 40x slower than a plain run.
 libc's startup code walks the environment and argv[0], so the guest gets an
 empty environment and a fixed argv[0]. That makes the total the same on every
 machine, not just the program's own share.
+
+A program built with --accel runs proven custom instructions that QEMU does
+not know; the runtime emulates each one in software from a SIGILL handler.
+The faulting instruction itself counts once, in the program, as it would on
+a CPU that has it. The emulation (the handler, the pyr_emul.* functions and
+the kernel's signal-return trampoline) is reported separately and left out
+of the counted total.
 """
 
 from __future__ import annotations
@@ -36,6 +43,14 @@ from pathlib import Path
 from src import runner
 
 QEMU_COUNT_ARGS = ('-0', 'prog', '-one-insn-per-tb', '-d', 'nochain,exec')
+
+EMULATION_PREFIX = 'pyr_emul.'
+TRAP_HANDLER = 'pyr_accel_trap'
+EMULATION_FUNCTIONS = {TRAP_HANDLER, '__vdso_rt_sigreturn'}
+
+
+def is_emulation(function: str) -> bool:
+    return function in EMULATION_FUNCTIONS or function.startswith(EMULATION_PREFIX)
 
 _TRACE_RE = re.compile(rb'^Trace \d+: \S+ \[[0-9a-f]+/([0-9a-f]+)/[0-9a-f]+/[0-9a-f]+\] ?(\S*)')
 _ASM_FUNC_RE = re.compile(r'^\s*\.type\s+([^,\s]+),\s*@function', re.MULTILINE)
@@ -55,7 +70,20 @@ class Profile:
 
     @property
     def total(self) -> int:
+        """Every executed instruction, emulation included."""
         return sum(self.by_pc.values())
+
+    @property
+    def emulation(self) -> int:
+        """Instructions spent emulating custom instructions in software."""
+        return sum(n for pc, n in self.by_pc.items()
+                   if is_emulation(self.function_at.get(pc, '')))
+
+    @property
+    def custom_instructions(self) -> int:
+        """Custom instructions executed: one trap each."""
+        entry = [pc for pc, f in self.function_at.items() if f == TRAP_HANDLER]
+        return self.by_pc[min(entry)] if entry else 0
 
     def by_function(self) -> Counter[str]:
         counts: Counter[str] = Counter()
@@ -138,8 +166,13 @@ def run_counted(exe: str, stdin: str | bytes | None = None,
 
 
 def program_functions(asm: str) -> frozenset[str]:
-    """Names of the functions defined in an llc assembly file."""
-    return frozenset(_ASM_FUNC_RE.findall(Path(asm).read_text()))
+    """Names of the functions compiled from the program, from llc's assembly.
+
+    Emulation copies of accelerated functions are compiled with the program
+    but are not part of it.
+    """
+    return frozenset(f for f in _ASM_FUNC_RE.findall(Path(asm).read_text())
+                     if not is_emulation(f))
 
 
 def mnemonics(exe: str, functions: frozenset[str]) -> dict[int, str]:
@@ -171,23 +204,30 @@ def profile_program(arts: dict[str, str], stdin: str | None = None,
 
 def report(profile: Profile, top: int = 8) -> str:
     """A short human-readable summary of a Profile."""
-    total = profile.total
+    emulation = profile.emulation
+    total = profile.total - emulation
     prog = profile.program
+    custom = profile.custom_instructions
     pct = (lambda n: f'{100 * n / total:5.1f}%') if total else (lambda n: '')
     lines = [
         'executed RISC-V instructions',
-        f'  your program  {prog:>12,}  {pct(prog)}',
+        f'  your program  {prog:>12,}  {pct(prog)}'
+        + (f'   ({custom:,} of them custom instructions)' if custom else ''),
         f'  everything else {total - prog:>10,}  {pct(total - prog)}'
         '   (startup, printf, runtime)',
         f'  total         {total:>12,}',
     ]
+    if emulation:
+        lines.append(f'  not counted   {emulation:>12,}           '
+                     '(software emulation of the custom instructions)')
     functions = profile.by_function().most_common()
     lines += ['', 'your functions']
     lines += [f'  {n:>12,}  {name}' for name, n in functions
               if name in profile.program_functions]
     lines += ['', f'hottest elsewhere (top {top})']
     lines += [f'  {n:>12,}  {name}' for name, n in
-              [f for f in functions if f[0] not in profile.program_functions][:top]]
+              [f for f in functions if f[0] not in profile.program_functions
+               and not is_emulation(f[0])][:top]]
     mix = profile.program_mix()
     if mix and '?' not in mix:
         lines += ['', 'instruction mix in your program']
