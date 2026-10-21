@@ -26,6 +26,15 @@ class TestTargetAndLayout(unittest.TestCase):
         self.assertIn('define i32 @"main"()', ir)
         self.assertIn('ret i32 0', ir)
 
+    def test_string_constants_have_symbolic_names(self):
+        # A global named "0" prints as `%hi(0)` in assembly, which an
+        # assembler reads as address zero.
+        mod = llvm.parse_assembly(ir_text_for('print("hi")\nprint(1)\n'))
+        names = [g.name for g in mod.global_variables]
+        self.assertTrue(names)
+        for name in names:
+            self.assertFalse(name[0].isdigit(), name)
+
 
 class TestNoUndef(unittest.TestCase):
     def test_bool_op_no_placeholder_block_crash(self):
@@ -112,6 +121,37 @@ print(f(7, 2))
         llvm.parse_assembly(ir_text_for(self.SRC)).verify()
 
 
+class TestNarrowInts(unittest.TestCase):
+    SRC = '''
+def dot(a: list[int8], b: list[int8], s: int8) -> int:
+    acc = 0
+    for i in range(len(a)):
+        acc = acc + int(a[i]) * int(b[i])
+    t = a[0] * b[0] + (a[1] << s) + a[2] ** s
+    return acc + int(t)
+w: list[int8] = [1, -2, 3, -4]
+print(dot(w, w, 1))
+'''
+
+    def test_lists_are_packed_bytes(self):
+        self.assertIn('%"list[int8]" = type {i32, i8*}', ir_text_for(self.SRC))
+
+    def test_arithmetic_stays_at_eight_bits(self):
+        ir = ir_text_for(self.SRC)
+        self.assertRegex(ir, r'mul i8 ')
+        self.assertRegex(ir, r'sext i8 .* to i32')
+
+    def test_shift_count_masked_to_width(self):
+        mod = llvm.parse_assembly(ir_text_for(self.SRC))
+        shifts = [ins for fn in mod.functions for bb in fn.blocks
+                  for ins in bb.instructions if ins.opcode == 'shl']
+        self.assertEqual(len(shifts), 1)
+        self.assertRegex(str(list(shifts[0].operands)[1]).strip(), r'= and i8 .*, 7$')
+
+    def test_module_verifies(self):
+        llvm.parse_assembly(ir_text_for(self.SRC)).verify()
+
+
 class TestIRVerifies(unittest.TestCase):
     def test_verify_accepts(self):
         src = '''
@@ -178,6 +218,22 @@ print(get())
         mod.verify()
         # The function body must reference the @g_c global.
         self.assertRegex(ir, r'load i32, i32\* @"?g_c"?')
+
+    def test_global_declared_after_a_function(self):
+        # Regression: the backend never popped a function's argument scope,
+        # so K became an alloca in main and f read another function's value.
+        src = '''
+def first(x: int) -> int:
+    return x
+K = 7
+def f(a: int, b: int, c: int) -> int:
+    return K * a + b
+print(f(1, 2, 3))
+'''
+        ir = ir_text_for(src)
+        llvm.parse_assembly(ir).verify()
+        body = ir.split('define i32 @"test.f"', 1)[1].split('\n}', 1)[0]
+        self.assertRegex(body, r'load i32, i32\* @"?g_K"?')
 
     def test_function_writes_global(self):
         src = '''

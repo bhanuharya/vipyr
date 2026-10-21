@@ -83,8 +83,27 @@ python3.12 -m venv .venv                 # llvmlite 0.43 needs Python <= 3.12
 . .venv/bin/activate
 pip install -r requirements.txt          # llvmlite, ziglang
 python -m src.runner tests/standard.py   # compile to RISC-V, run under QEMU
+python -m src.runner tests/standard.py --count   # ...and count executed instructions
 ./run_regression_tests.sh                # full suite, including QEMU runs
 ```
+
+`--count` reports how many RISC-V instructions the program executed and in
+which functions. [docs/measuring.md](docs/measuring.md) explains how it works
+and has short exercises for reading the results.
+
+### Custom instructions
+
+```bash
+python -m src.runner prog.py --accel q15mul:0:0 --count
+```
+
+compiles every call to the function `q15mul` to one custom RISC-V
+instruction (custom-0 opcode, funct3 0, funct7 0). Stock QEMU does not know
+the instruction, so the runtime emulates it in software, and `--count`
+counts it as one instruction. vipyr does not check that a circuit for the
+instruction computes the same thing as the function;
+[AEGIS-V](https://github.com/bhanuharya/aegis-v) does that, then calls vipyr.
+See [docs/custom-instructions.md](docs/custom-instructions.md).
 
 Without a glibc cross toolchain (`PYRV_CC` or
 `riscv32-unknown-linux-gnu-clang` on `PATH`), the runner links with Zig's
@@ -117,13 +136,15 @@ Buildroot GCC driver.
 The implementation currently covers a restricted, typed subset of Python:
 
 - `int`, `float`, `bool`, `str`, and lists
-- assignments and augmented assignments
-- arithmetic and comparisons
+- `int8` and `int16`, for packed data such as neural-network weights
+- assignments, annotated assignments (`w: list[int8] = [1, -2]`), and
+  augmented assignments
+- arithmetic, bitwise operators, shifts, and comparisons
 - boolean `and` and `or`
-- `if`, `while`, `for`, and `break`
+- `if`, `while`, `for`, `break`, and `continue`
 - functions, parameters, and `return`
 - `print`, `input`, `len`, and `range`
-- `float()`, `int()`, `str()`, and `bool()` conversions
+- `float()`, `int()`, `int8()`, `int16()`, `str()`, and `bool()` conversions
 - `abs()`, `min()`, and `max()`
 - string concatenation (`+`) and repetition (`*`)
 - list construction, iteration, indexing, and element assignment
@@ -440,6 +461,13 @@ Compare optimization pipelines only after verifying:
 3. The executable was built for the same RISC-V ABI and target features.
 4. The instruction-count method is unchanged.
 5. Runtime measurements are repeated enough to overcome QEMU timing noise.
+
+Use the executed count of the program's own functions (`--count`, "your
+program") rather than a static count. Two caveats apply to the historical
+results in `hasil/`. The executables were linked from bitcode, which the C
+compiler recompiled at `-O0`, so they did not run `llc`'s optimized output.
+And `opt_build.py` counts every disassembly line of the whole static binary,
+which is mostly libc. See [docs/measuring.md](docs/measuring.md).
 
 The central research trade-off is not only code reduction. It is the relationship between:
 

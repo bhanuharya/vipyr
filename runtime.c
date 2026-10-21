@@ -2,8 +2,9 @@
  * pyrv runtime library
  *
  * Provides a simple bump allocator for heap-allocated buffers (list element
- * arrays, concatenated/repeated string buffers, etc.), integer `**`, and an
- * optional subscript bounds-check helper.
+ * arrays, concatenated/repeated string buffers, etc.), integer `**`, an
+ * optional subscript bounds-check helper, and software emulation of proven
+ * custom instructions for CPUs that lack them.
  *
  * Design notes:
  *   - The heap is a single mmap'd region, allocated lazily on first use.
@@ -15,10 +16,13 @@
  *     sized the heap generously).
  */
 
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/mman.h>
+#include <ucontext.h>
 #include <unistd.h>
 
 #define PYR_HEAP_SIZE (16u * 1024u * 1024u)  /* 16 MB */
@@ -106,4 +110,64 @@ void pyr_bounds_check(int32_t index, uint32_t count)
                 index, (unsigned)count);
         exit(1);
     }
+}
+
+/*
+ * Software emulation of custom instructions (see src/accel.py).
+ *
+ * A program compiled with --accel uses custom-0 instructions (opcode 0x0B,
+ * R-type) that stock QEMU and most CPUs reject as illegal. The compiler
+ * passes a table mapping each instruction's funct7:funct3 to an emulation
+ * function with the instruction's exact contract: two 32-bit registers in,
+ * one out. On SIGILL the handler decodes the faulting instruction, and if it
+ * is in the table, computes rd from rs1 and rs2 and resumes after it. Any
+ * other illegal instruction still kills the program, as it would without
+ * the handler.
+ */
+typedef struct {
+    uint32_t key; /* funct7 << 3 | funct3 */
+    uint32_t (*fn)(uint32_t, uint32_t);
+} pyr_accel_entry;
+
+static const pyr_accel_entry *pyr_accel_table = (const pyr_accel_entry *)0;
+static uint32_t pyr_accel_count = 0;
+
+static void pyr_accel_trap(int sig, siginfo_t *info, void *context)
+{
+    (void)info;
+    /* The general registers come first in mcontext_t on RISC-V Linux, with
+     * the PC in slot 0 and x1..x31 after it, in both musl and glibc. */
+    unsigned long *regs = (unsigned long *)&((ucontext_t *)context)->uc_mcontext;
+    const uint16_t *pc = (const uint16_t *)regs[0];
+    uint32_t insn = (uint32_t)pc[0] | ((uint32_t)pc[1] << 16);
+    if ((insn & 0x7fu) == 0x0bu) {
+        uint32_t key = (insn >> 25) << 3 | ((insn >> 12) & 7u);
+        uint32_t rd = (insn >> 7) & 31u, rs1 = (insn >> 15) & 31u, rs2 = (insn >> 20) & 31u;
+        for (uint32_t i = 0; i < pyr_accel_count; i++) {
+            if (pyr_accel_table[i].key == key) {
+                uint32_t a = rs1 ? (uint32_t)regs[rs1] : 0u;
+                uint32_t b = rs2 ? (uint32_t)regs[rs2] : 0u;
+                uint32_t r = pyr_accel_table[i].fn(a, b);
+                if (rd) {
+                    regs[rd] = r;
+                }
+                regs[0] += 4;
+                return;
+            }
+        }
+    }
+    /* Not ours: restore the default action; the instruction faults again. */
+    signal(sig, SIG_DFL);
+}
+
+void pyr_accel_init(const pyr_accel_entry *table, uint32_t count)
+{
+    struct sigaction sa;
+    pyr_accel_table = table;
+    pyr_accel_count = count;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = pyr_accel_trap;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGILL, &sa, (struct sigaction *)0);
 }

@@ -14,6 +14,8 @@ Environment variable configuration:
                     riscv32-unknown-linux-gnu-clang)
     PYRV_SYSROOT    cross sysroot for --sysroot (default: /opt/riscv/sysroot)
     PYRV_QEMU_USER  qemu-riscv32 user-mode binary (default: qemu-riscv32)
+    PYRV_OBJDUMP    llvm-objdump, for --count's instruction mix
+                    (default: llvm-objdump-14, then llvm-objdump)
     PYRV_READLINE   path to readline.c helper (default: ./readline.c)
     PYRV_RUNTIME_LIB path to a runtime shared dir containing readline.c
                      (used when readline.c is not in the current dir)
@@ -25,7 +27,11 @@ ziglang`). That needs no sysroot and produces static rv32gc/ilp32d binaries.
 
 Command line:
 
-    python -m src.runner prog.py [--passes simplifycfg,instcombine]
+    python -m src.runner prog.py [--passes simplifycfg,instcombine] [--count]
+                                 [--accel NAME:FUNCT3:FUNCT7]
+
+--count runs the program under QEMU's instruction trace and reports how many
+RISC-V instructions it executed, and where (see src/icount.py).
 """
 
 from __future__ import annotations
@@ -99,6 +105,10 @@ def sysroot_path() -> str:
 
 def qemu_user_path() -> str:
     return _which('qemu-riscv32', 'PYRV_QEMU_USER')
+
+
+def objdump_path() -> str:
+    return _which_any(['llvm-objdump-14', 'llvm-objdump'], 'PYRV_OBJDUMP')
 
 
 def readline_path() -> str:
@@ -193,14 +203,38 @@ def check_toolchain():
             raise ToolchainError(f'sysroot not found: {sysroot_path()}')
 
 
+_ACCEL_RE = re.compile(r'[A-Za-z_]\w*:[0-7]:(?:[0-9]|[1-9][0-9]|1[01][0-9]|12[0-7])')
+
+
+def accel_flags(accel: list[str]) -> list[str]:
+    """Frontend flags for NAME:FUNCT3:FUNCT7 custom-instruction requests."""
+    flags, seen = [], {}
+    for item in accel:
+        if not _ACCEL_RE.fullmatch(item):
+            raise ToolchainError(f'--accel {item}: expected NAME:FUNCT3:FUNCT7 with '
+                                 f'funct3 0-7 and funct7 0-127')
+        encoding = item.split(':', 1)[1]
+        if encoding in seen:
+            raise ToolchainError(f'--accel {item} and {seen[encoding]} use the same encoding')
+        seen[encoding] = item
+        flags += ['--accel', item]
+    return flags
+
+
 def compile_program(src: str, out_dir: str, passes: str | None = None,
                     name: str | None = None,
-                    bounds_check: bool = False) -> dict[str, str]:
+                    bounds_check: bool = False,
+                    accel: list[str] | None = None) -> dict[str, str]:
     """
     Compile a .py source through IR -> opt -> llc -> link.
 
+    `accel` lists NAME:FUNCT3:FUNCT7 requests: calls to function NAME become
+    one custom-0 instruction with that encoding (docs/custom-instructions.md).
+    The compiler does not check that the instruction computes the same thing
+    as the function; that is the job of a separate checker, such as AEGIS-V.
+
     Returns a dict mapping stage names to output file paths:
-        ir, opt_bc, asm, exe
+        ir, opt_bc, obj, asm, exe
     """
     src = str(src)
     out_dir = Path(out_dir)
@@ -209,6 +243,7 @@ def compile_program(src: str, out_dir: str, passes: str | None = None,
 
     ir = out_dir / f'{base}.ll'
     opt_bc = out_dir / f'{base}.opt.bc'
+    obj = out_dir / f'{base}.o'
     asm = out_dir / f'{base}.s'
     exe = out_dir / f'{base}.riscv'
 
@@ -218,6 +253,8 @@ def compile_program(src: str, out_dir: str, passes: str | None = None,
     frontend_cmd = [os.sys.executable, str(frontend), src, '-o', str(ir)]
     if bounds_check:
         frontend_cmd.append('--bounds-check')
+    if accel:
+        frontend_cmd += accel_flags(accel)
     proc = _run(frontend_cmd)
     if proc.returncode != 0:
         raise ToolchainError(f'frontend failed:\n{proc.stderr}')
@@ -238,16 +275,20 @@ def compile_program(src: str, out_dir: str, passes: str | None = None,
     if proc.returncode != 0:
         raise ToolchainError(f'opt -verify failed:\n{proc.stderr}')
 
-    # Codegen.
+    # Codegen. llc writes the object we link and, for reading, the same code
+    # as assembly. Linking the bitcode instead would let the C driver
+    # recompile it at -O0 and throw llc's output away.
     llc = llc_path()
     _check_tool(llc, 'llc')
-    proc = _run([llc, '-march=riscv32', '-mattr=' + LLC_MATTRS,
-                 str(opt_bc), '-o', str(asm)])
-    if proc.returncode != 0:
-        raise ToolchainError(f'llc failed:\n{proc.stderr}')
+    llc_cmd = [llc, '-march=riscv32', '-mattr=' + LLC_MATTRS,
+               '-target-abi=' + RISCV_MABI, str(opt_bc)]
+    for filetype, out in (('obj', obj), ('asm', asm)):
+        proc = _run(llc_cmd + ['-filetype=' + filetype, '-o', str(out)])
+        if proc.returncode != 0:
+            raise ToolchainError(f'llc failed:\n{proc.stderr}')
 
     # Link. Float `%` lowers to a call to fmod, hence -lm.
-    proc = _run(link_command() + [str(opt_bc), readline_path(),
+    proc = _run(link_command() + [str(obj), readline_path(),
                                   runtime_path(), '-lm', '-o', str(exe)])
     if proc.returncode != 0:
         raise ToolchainError(f'link failed:\n{proc.stderr}')
@@ -255,9 +296,22 @@ def compile_program(src: str, out_dir: str, passes: str | None = None,
     return {
         'ir': str(ir),
         'opt_bc': str(opt_bc),
+        'obj': str(obj),
         'asm': str(asm),
         'exe': str(exe),
     }
+
+
+def qemu_command(exe: str, qemu_args: tuple[str, ...] = ()) -> list[str]:
+    """The qemu-riscv32 command line that runs `exe`."""
+    qemu = qemu_user_path()
+    _check_tool(qemu, 'qemu-riscv32')
+    sysroot = sysroot_path()
+    # -L lets QEMU find a glibc sysroot's dynamic loader. Static Zig/musl
+    # binaries don't need one, so skip it when there is no sysroot.
+    if os.path.isdir(sysroot):
+        qemu_args = ('-L', sysroot) + tuple(qemu_args)
+    return [qemu, *qemu_args, str(exe)]
 
 
 def run_qemu(exe: str, stdin: str | None = None, timeout: int = 120,
@@ -268,12 +322,7 @@ def run_qemu(exe: str, stdin: str | None = None, timeout: int = 120,
     Returns (exit_code, stdout, stderr). The guest exit status is returned
     as-is (0 on success). Output beyond max_output bytes is truncated.
     """
-    qemu = qemu_user_path()
-    _check_tool(qemu, 'qemu-riscv32')
-    sysroot = sysroot_path()
-    # -L lets QEMU find a glibc sysroot's dynamic loader. Static Zig/musl
-    # binaries don't need one, so skip it when there is no sysroot.
-    cmd = [qemu, '-L', sysroot, str(exe)] if os.path.isdir(sysroot) else [qemu, str(exe)]
+    cmd = qemu_command(exe)
     try:
         proc = subprocess.run(
             cmd, input=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -314,15 +363,28 @@ def main(argv: list[str] | None = None) -> int:
                         help='emit runtime bounds checks for subscripts')
     parser.add_argument('--keep', metavar='DIR',
                         help='write the .ll/.s/.riscv artifacts to DIR')
+    parser.add_argument('--count', action='store_true',
+                        help='count executed instructions (report on stderr)')
+    parser.add_argument('--accel', action='append', metavar='NAME:FUNCT3:FUNCT7',
+                        help='compile calls to function NAME to one custom-0 instruction '
+                             '(unchecked: see docs/custom-instructions.md)')
     args = parser.parse_args(argv)
 
     out_dir = args.keep or tempfile.mkdtemp(prefix='pyrv-')
     try:
         arts = compile_program(args.src, out_dir, passes=args.passes or None,
-                               bounds_check=args.bounds_check)
-        code, out, err = run_qemu(arts['exe'])
+                               bounds_check=args.bounds_check, accel=args.accel)
+        if args.count:
+            from src import icount
+            profile = icount.profile_program(arts)
+            code, out, err = profile.exit_code, profile.stdout, profile.stderr
+        else:
+            code, out, err = run_qemu(arts['exe'])
         sys.stdout.buffer.write(out)
         sys.stderr.buffer.write(err)
+        if args.count:
+            sys.stdout.flush()
+            print('\n' + icount.report(profile), file=sys.stderr)
         return code
     except ToolchainError as e:
         print(f'error: {e}', file=sys.stderr)

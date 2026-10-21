@@ -8,6 +8,10 @@ from pathlib import Path
 import llvmlite.ir as ir
 import llvmlite.binding as llvm
 
+# The custom-0 major opcode, set aside by the RISC-V spec for custom
+# extensions. Accelerated functions compile to R-type instructions with it.
+CUSTOM_0 = 0x0B
+
 PRINT_IR = False
 #PRINT_IR = True
 
@@ -25,7 +29,8 @@ class LLVMBackend():
     symbols: list[dict[str, LLVMSymbol]]
     target_machine: llvm.TargetMachine
     triple: str
-    def __init__(self, fileName: str, outFile: str = 'out.ll', boundsCheck: bool = False):
+    def __init__(self, fileName: str, outFile: str = 'out.ll', boundsCheck: bool = False,
+                 accel: dict[str, tuple[int, int]] | None = None):
         self.outFile = outFile
         # When enabled every list/string subscript emits a runtime bounds
         # check (pyr_bounds_check) before the element access.
@@ -122,8 +127,37 @@ class LLVMBackend():
         # pyr_alloc_init is idempotent and cheap, so this is always safe.
         self.builder.call(pyr_alloc_init, [])
 
+        # Functions to compile to custom instructions (--accel), as
+        # name -> (funct3, funct7); see docs/custom-instructions.md. The
+        # runtime emulates each one when the CPU lacks it (stock QEMU does),
+        # from a table built in emitFile.
+        self.accel = dict(accel or {})
+        self.accelEntries: dict[str, ir.Function] = {}
+        if self.accel:
+            entryT = ir.LiteralStructType([ir.IntType(32), voidPtr])
+            self.accelTable = ir.GlobalVariable(
+                self.module, ir.ArrayType(entryT, len(self.accel)), 'pyr_accel_table')
+            self.accelTable.global_constant = True
+            self.accelTable.linkage = 'internal'
+            pyr_accel_init = ir.Function(self.module, ir.FunctionType(ir.VoidType(), [
+                voidPtr, ir.IntType(32)]), 'pyr_accel_init')
+            self.builder.call(pyr_accel_init, [
+                self.builder.bitcast(self.accelTable, voidPtr),
+                ir.Constant(ir.IntType(32), len(self.accel))])
+
     def emitFile(self):
         self.builder.ret(self.getConstant(0, 32))
+        if self.accel:
+            missing = sorted(set(self.accel) - set(self.accelEntries))
+            if missing:
+                raise CompileError(f'--accel names functions that are not defined: {", ".join(missing)}')
+            entryT = self.accelTable.type.pointee.element
+            entries = []
+            for name in sorted(self.accel):
+                funct3, funct7 = self.accel[name]
+                fnPtr = self.accelEntries[name].bitcast(entryT.elements[1])
+                entries.append(ir.Constant(entryT, [ir.Constant(ir.IntType(32), funct7 << 3 | funct3), fnPtr]))
+            self.accelTable.initializer = ir.Constant(self.accelTable.type.pointee, entries)
         llvm_ir = str(self.module)
 
         if PRINT_IR:
@@ -151,8 +185,10 @@ class LLVMBackend():
         strT = ir.ArrayType(ir.IntType(8), len(strBytes))
         strConstant = ir.Constant(strT, strBytes)
 
+        # A bare numeric name like "0" would print as `%hi(0)` in assembly,
+        # which an assembler reads as address zero.
         globalV = ir.GlobalVariable(
-            self.module, strT, str(self.globalCount))
+            self.module, strT, f'.str.{self.globalCount}')
         globalV.global_constant = True
         globalV.initializer = strConstant # type: ignore
         globalV.linkage = 'internal'
@@ -599,9 +635,14 @@ class LLVMBackend():
         base = node.base
 
         fn = ir.Function(module=self.module, ftype=node.t.toLLVM(), name=self.makeFnName(base.name))
-        entry = fn.append_basic_block('entry')
-
         self.symbols[-1][self.makeFnName(base.name)] = LLVMSymbol(node.t, fn)
+        self.emitFunctionBody(node, fn)
+        if base.name in self.accel:
+            self.emitEmulation(node, base.name)
+        return fn
+
+    def emitFunctionBody(self, node: CheckedFnDefNode, fn: ir.Function):
+        entry = fn.append_basic_block('entry')
         self.symbols.append(dict())
 
         was_fn = self.fn
@@ -632,10 +673,53 @@ class LLVMBackend():
                 else:
                     self.builder.ret(ir.Constant(retType.toLLVM(), None))
 
+        # Drop the argument scope. Left on the stack, it turned every later
+        # module-level variable into a local of main, which later functions
+        # then referenced across function boundaries.
+        self.symbols.pop()
         self.fn = was_fn
         self.builder = was_builder
 
-        return fn
+    def emitEmulation(self, node: CheckedFnDefNode, name: str):
+        """
+        A software copy of an accelerated function, for CPUs without the
+        instruction. `pyr_emul.<fn>` takes and returns whole registers, as
+        the instruction does; it calls a clone of the body so that executed-
+        instruction counts can tell emulation apart from the program.
+        """
+        fnT = node.t.asCallable()
+        types = fnT.args + [fnT.returnType]
+        if not (1 <= len(fnT.args) <= 2 and all(t.isInteger() or t.isBool() for t in types)):
+            raise CompileError(f'--accel {name}: an instruction takes one or two integers and returns one')
+        body = ir.Function(self.module, node.t.toLLVM(), name=f'pyr_emul.body.{self.makeFnName(name)}')
+        self.emitFunctionBody(node, body)
+        reg = ir.IntType(32)
+        wrapper = ir.Function(self.module, ir.FunctionType(reg, [reg, reg]), name=f'pyr_emul.{self.makeFnName(name)}')
+        builder = ir.IRBuilder(wrapper.append_basic_block('entry'))
+        args = [builder.trunc(a, t.toLLVM()) if t.toLLVM().width < 32 else a
+                for a, t in zip(wrapper.args, fnT.args)]
+        builder.ret(self.toRegister(builder, builder.call(body, args), fnT.returnType))
+        self.accelEntries[name] = wrapper
+
+    def toRegister(self, builder: ir.IRBuilder, val: ir.Value, t: Class) -> ir.Value:
+        """Widen an integer or bool to a 32-bit register, as the ABI does."""
+        reg = ir.IntType(32)
+        if val.type.width == 32:
+            return val
+        return builder.zext(val, reg) if t.isBool() else builder.sext(val, reg)
+
+    def doCustomInstruction(self, name: str, args: list[ir.Value], fnT: FnType) -> ir.Value:
+        """A call to an accelerated function, as one custom-0 instruction."""
+        funct3, funct7 = self.accel[name]
+        reg = ir.IntType(32)
+        regs = [self.toRegister(self.builder, a, t) for a, t in zip(args, fnT.args)]
+        regs += [ir.Constant(reg, 0)] * (2 - len(regs))
+        # No side effects: like an add, LLVM may move, merge or drop it.
+        result = self.builder.asm(ir.FunctionType(reg, [reg, reg]),
+                                  f'.insn r {CUSTOM_0}, {funct3}, {funct7}, $0, $1, $2',
+                                  '=r,r,r', regs, False, name=name)
+        retT = fnT.returnType.toLLVM()
+        return self.builder.trunc(result, retT) if retT.width < 32 else result
     
     def evalFor(self, node: CheckedForNode):
         self.symbols.append(dict())
@@ -782,14 +866,20 @@ class LLVMBackend():
             ast.Mod: (self.builder.frem, self.builder.srem)
         }
 
-        if t.isInt():
+        if t.isInteger():
             match bop:
                 case ast.Div() | ast.Mod():
                     return self.doIntDivRem(left, right, isinstance(bop, ast.Mod))
                 case ast.FloorDiv():
                     return self.doIntFloorDiv(left, right)
                 case ast.Pow():
-                    return self.builder.call(self.symbols[0]['pyr_ipow'].ptr, [left, right])
+                    # The runtime works on int; narrow results are the same
+                    # value modulo 2^bits.
+                    intT = ir.IntType(REGISTER_SIZE)
+                    res = self.builder.call(self.symbols[0]['pyr_ipow'].ptr,
+                                            [self.doIntResize(left, intT),
+                                             self.doIntResize(right, intT)])
+                    return self.doIntResize(res, left.type)
                 case ast.BitAnd():
                     return self.builder.and_(left, right)
                 case ast.BitOr():
@@ -797,11 +887,11 @@ class LLVMBackend():
                 case ast.BitXor():
                     return self.builder.xor(left, right)
                 case ast.LShift() | ast.RShift():
-                    # Like RISC-V sll/sra, use only the low 5 bits of the
-                    # count. This also keeps LLVM shl/ashr defined: they
-                    # are poison for counts >= 32. The mask costs nothing
-                    # on RISC-V, where the shift instructions ignore the
-                    # upper bits anyway.
+                    # Take the count modulo the width; for int that is the
+                    # low 5 bits, as RISC-V sll/sra use. This also keeps LLVM
+                    # shl/ashr defined: they are poison for counts >= the
+                    # width. For int the mask costs nothing on RISC-V, where
+                    # the shift instructions ignore the upper bits anyway.
                     count = self.builder.and_(right, ir.Constant(right.type, right.type.width - 1))
                     if isinstance(bop, ast.LShift):
                         return self.builder.shl(left, count)
@@ -1031,10 +1121,20 @@ class LLVMBackend():
         return self.builder.sitofp(val, retType.toLLVM())
     
     def doIntCast(self, args: list[CheckedNode], retType: Class) -> ir.Value:
+        """int(x), int8(x), int16(x)."""
         assert len(args) == 1
         val = self.evalNode(args[0], False)
-        
-        return self.builder.fptosi(val, retType.toLLVM())
+        if args[0].t.isFloat():
+            return self.builder.fptosi(val, retType.toLLVM())
+        return self.doIntResize(val, retType.toLLVM())
+
+    def doIntResize(self, val: ir.Value, intT: ir.IntType) -> ir.Value:
+        """Sign-extend or wrap an integer to another width."""
+        if val.type.width < intT.width:
+            return self.builder.sext(val, intT)
+        if val.type.width > intT.width:
+            return self.builder.trunc(val, intT)
+        return val
 
     def doStr(self, args: list[CheckedNode]) -> ir.Value:
         """str(int) or str(float): convert to string via sprintf."""
@@ -1044,10 +1144,11 @@ class LLVMBackend():
         from .type import ListType, Class
         str_t = ListType("str", Class('char'))
         strT = str_t.toLLVM()
-        if arg.t.isInt():
+        if arg.t.isInteger():
             # Max i32 is -2147483648 (11 chars + NUL = 12 bytes)
             buf = self.heapAlloc(ir.IntType(8), 12)
             fmt = self.getConstString('%d')
+            val = arg.t.getPrintfArgument(self.builder, val)
             self.builder.call(self.symbols[0]['sprintf'].ptr, [buf, fmt, val])
             strlen = self.symbols[0]['strlen'].ptr
             length = self.builder.call(strlen, [buf])
@@ -1067,16 +1168,17 @@ class LLVMBackend():
         assert len(args) == 1
         val = self.evalNode(args[0], False)
         # icmp returns i1, which is the LLVM representation of bool
-        return self.builder.icmp_signed('!=', val, self.getConstant(0, 32))
+        return self.builder.icmp_signed('!=', val, ir.Constant(val.type, 0))
 
     def doAbs(self, args: list[CheckedNode]) -> ir.Value:
         """abs(int) or abs(float)."""
         assert len(args) == 1
         arg = args[0]
         val = self.evalNode(arg, False)
-        if arg.t.isInt():
-            neg = self.builder.sub(self.getConstant(0, 32), val)
-            is_neg = self.builder.icmp_signed('<', val, self.getConstant(0, 32))
+        if arg.t.isInteger():
+            zero = ir.Constant(val.type, 0)
+            neg = self.builder.sub(zero, val)
+            is_neg = self.builder.icmp_signed('<', val, zero)
             return self.builder.select(is_neg, neg, val)
         if arg.t.isFloat():
             zero = ir.Constant(ir.DoubleType(), 0.0)
@@ -1101,7 +1203,7 @@ class LLVMBackend():
         assert len(args) == 2
         a = self.evalNode(args[0], False)
         b = self.evalNode(args[1], False)
-        if args[0].t.isInt() and args[1].t.isInt():
+        if args[0].t.isInteger() and args[1].t.isInteger():
             op = '>' if is_max else '<'
             cond = self.builder.icmp_signed(op, a, b)
             return self.builder.select(cond, a, b)
@@ -1124,7 +1226,7 @@ class LLVMBackend():
                 return self.doRange(node.args, node.fnType.asCallable().returnType)
             case 'float':
                 return self.doFloatCast(node.args, node.fnType.asCallable().returnType)
-            case 'int':
+            case 'int' | 'int8' | 'int16':
                 return self.doIntCast(node.args, node.fnType.asCallable().returnType)
             case 'str':
                 return self.doStr(node.args)
@@ -1149,7 +1251,9 @@ class LLVMBackend():
         args = []
         for arg in node.args:
             args.append(self.evalNode(arg, False))
-        
+
+        if isinstance(node.operand.base, ast.Name) and node.operand.base.id in self.accel:
+            return self.doCustomInstruction(node.operand.base.id, args, node.fnType.asCallable())
         return self.builder.call(operand, args)
 
     def makeStringFromPointer(self, ptr: ir.Value, count: ir.Value | int, llvmT: ir.Type) -> ir.Value:

@@ -16,6 +16,9 @@ def main():
     parser.add_argument('--bits', '-b', type=int, default=32)
     parser.add_argument('--output', '-o', default='out.ll',
                         help='Output LLVM IR file (default: out.ll)')
+    parser.add_argument('--accel', action='append', default=[], metavar='NAME:FUNCT3:FUNCT7',
+                        help='compile calls to function NAME to one custom-0 instruction '
+                             '(unchecked: see docs/custom-instructions.md)')
     parser.add_argument('--bounds-check', action='store_true', default=False,
                         help='Emit runtime bounds checks for list/string subscripts; '
                              'an out-of-range index prints an IndexError to stderr '
@@ -23,8 +26,12 @@ def main():
     args = parser.parse_args()
 
     constants.REGISTER_SIZE = args.bits
+    accel = {}
+    for item in args.accel:
+        name, funct3, funct7 = item.split(':')
+        accel[name] = (int(funct3), int(funct7))
     compiler = Compiler(args.filein, outFile=args.output,
-                        boundsCheck=args.bounds_check)
+                        boundsCheck=args.bounds_check, accel=accel)
 
     try:
         with open(args.filein) as f:

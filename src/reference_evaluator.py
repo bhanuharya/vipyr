@@ -14,13 +14,14 @@ Semantics implemented here MUST match the language specification in
 docs/language-spec.md and the LLVM backend in src/llvm.py:
 
 - int is a 32-bit two's-complement value; arithmetic wraps (LLVM i32).
+  int8 and int16 follow the same rules at their own width.
 - `/` between ints is truncating integer division (sdiv semantics);
   `%` between ints is the signed remainder (srem semantics). Division by
   zero is defined with the RISC-V M-extension results (x / 0 == -1,
   x % 0 == x).
 - float is IEEE-754 double precision; `%` between floats is C fmod.
-- `//`, `**`, `&`, `|`, `^`, `<<`, `>>` and `~` are int-only and total
-  (spec §2.1); shift counts use only their low 5 bits.
+- `//`, `**`, `&`, `|`, `^`, `<<`, `>>` and `~` are integer-only and total
+  (spec §2.1); a shift count is taken modulo the bit width.
 - print formatting matches the C printf conversions used by the backend:
   int → %d, float → %f (6 decimals), bool → %d (0/1), str → %s, char → %c.
 - `and` / `or` short-circuit and require bool operands.
@@ -78,10 +79,20 @@ class _Continue(Exception):
     pass
 
 
+def wrap_int(value: int, bits: int) -> int:
+    """Wrap a Python int into a signed `bits`-wide two's-complement value."""
+    v = value & ((1 << bits) - 1)
+    return v - (1 << bits) if v >= (1 << (bits - 1)) else v
+
+
 def wrap_i32(value: int) -> int:
     """Wrap a Python int into a signed 32-bit value (LLVM i32 semantics)."""
-    v = value & 0xFFFFFFFF
-    return v - (1 << 32) if v >= (1 << 31) else v
+    return wrap_int(value, 32)
+
+
+def _bits(t: Class) -> int:
+    """Width of an integer type; 32 for anything else (unused there)."""
+    return t.intBits() if t.isInteger() else 32
 
 
 def _is_int(value) -> bool:
@@ -321,7 +332,7 @@ class ReferenceEvaluator:
     def _eval_binop(self, node: CheckedBinNode):
         left = self._eval_expr(node.left)
         right = self._eval_expr(node.right)
-        return self._apply_binop(left, right, node.op)
+        return self._apply_binop(left, right, node.op, _bits(node.t))
 
     @staticmethod
     def _div(a, b):
@@ -369,7 +380,7 @@ class ReferenceEvaluator:
         if isinstance(base, ast.Name):
             old = self._eval_expr(target)
             rhs = self._eval_expr(node.right)
-            res = self._apply_binop(old, rhs, node.op)
+            res = self._apply_binop(old, rhs, node.op, _bits(target.t))
             self._assign_name(base.id, res)
             return res
         if isinstance(base, ast.Subscript):
@@ -379,14 +390,15 @@ class ReferenceEvaluator:
             self._check_index(idx, len(lst))
             old = lst[idx]
             rhs = self._eval_expr(node.right)
-            res = self._apply_binop(old, rhs, node.op)
+            res = self._apply_binop(old, rhs, node.op, _bits(target.t))
             lst[idx] = res
             return res
         raise InterpretError(f'Unsupported augmented assignment target: {ast.dump(base)}')
 
     @staticmethod
-    def _apply_binop(left, right, op):
-        # Shared by plain and augmented binops so both wrap to i32.
+    def _apply_binop(left, right, op, bits=32):
+        # Shared by plain and augmented binops so both wrap to the type's
+        # width.
         if isinstance(op, ast.Add):
             res = left + right
         elif isinstance(op, ast.Sub):
@@ -409,13 +421,14 @@ class ReferenceEvaluator:
         elif isinstance(op, ast.BitXor):
             res = left ^ right
         elif isinstance(op, ast.LShift):
-            # Only the low 5 bits of the count are used (RISC-V sll/sra).
-            res = left << (right & 31)
+            # The count is taken modulo the width (RISC-V sll/sra use the
+            # low 5 bits for int).
+            res = left << (right & (bits - 1))
         elif isinstance(op, ast.RShift):
-            res = left >> (right & 31)
+            res = left >> (right & (bits - 1))
         else:
             raise InterpretError(f'Unsupported binary operator: {type(op).__name__}')
-        return wrap_i32(res) if _is_int(res) else res
+        return wrap_int(res, bits) if _is_int(res) else res
 
     @staticmethod
     def _ipow(base, exp):
@@ -433,7 +446,7 @@ class ReferenceEvaluator:
         value = self._eval_expr(node.operand)
         op = node.op
         if isinstance(op, ast.USub):
-            return wrap_i32(-value) if _is_int(value) else -value
+            return wrap_int(-value, _bits(node.t)) if _is_int(value) else -value
         if isinstance(op, ast.UAdd):
             return value
         if isinstance(op, ast.Not):
@@ -492,6 +505,9 @@ class ReferenceEvaluator:
         if name == 'int':
             assert len(node.args) == 1
             return wrap_i32(int(self._eval_expr(node.args[0])))
+        if name in ('int8', 'int16'):
+            assert len(node.args) == 1
+            return wrap_int(self._eval_expr(node.args[0]), _bits(node.t))
         if name == 'float':
             assert len(node.args) == 1
             return float(self._eval_expr(node.args[0]))
@@ -523,7 +539,7 @@ class ReferenceEvaluator:
             assert len(node.args) == 1
             val = self._eval_expr(node.args[0])
             if _is_int(val):
-                return wrap_i32(abs(val))
+                return wrap_int(abs(val), _bits(node.t))
             return abs(val)
         if name == 'min':
             assert len(node.args) == 2
