@@ -19,6 +19,21 @@ INT_ONLY_OPS = {
 The TypeChecker class goes through Python's AST (that we get from calling ast.parse)
 and assigns a type to each node, if there is an invalid/incompattible type or an unsupported node we raise an error and quit
 """
+# Builtins whose result type depends on the argument types.
+POLYMORPHIC_BUILTINS = ('abs', 'min', 'max', 'str', 'bool', 'int', 'float', 'int8', 'int16')
+
+
+def literalInt(node: ast.AST) -> int | None:
+    """The value of an integer literal, optionally negated, else None."""
+    sign = 1
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+        sign = -1 if isinstance(node.op, ast.USub) else 1
+        node = node.operand
+    if isinstance(node, ast.Constant) and type(node.value) is int:
+        return sign * node.value
+    return None
+
+
 class TypeChecker():
     types: dict[str, Class]
     symbols: List[dict[str, Class]]
@@ -53,6 +68,13 @@ class TypeChecker():
         floatType.methods['__init__'] = defaultInit()
         floatType.parent = obj
 
+        narrowInts = list[Class]()
+        for name in ('int8', 'int16'):
+            narrow = Class(name)
+            narrow.methods['__init__'] = defaultInit()
+            narrow.parent = obj
+            narrowInts.append(narrow)
+
         genericSlice = ListType('__generic__', objectType())
         genericSlice.methods['__init__'] = defaultInit()
         genericSlice.parent = obj
@@ -73,6 +95,8 @@ class TypeChecker():
         self.types['object'] = obj
         self.types['int'] = intType
         self.types['float'] = floatType
+        for narrow in narrowInts:
+            self.types[narrow.name] = narrow
         self.types['str'] = stringType
         self.types['bool'] = boolType
         self.types['<None>'] = noneType()
@@ -88,6 +112,8 @@ class TypeChecker():
         self.symbols[0]['int'] = FnType([floatType], intType)
         self.symbols[0]['str'] = FnType([objectType()], stringType)
         self.symbols[0]['bool'] = FnType([intType], boolType)
+        for narrow in narrowInts:
+            self.symbols[0][narrow.name] = FnType([intType], narrow)
 
         # Numeric
         self.symbols[0]['abs'] = FnType([objectType()], intType)
@@ -108,6 +134,8 @@ class TypeChecker():
         self.intrinsics.add('abs')
         self.intrinsics.add('min')
         self.intrinsics.add('max')
+        self.intrinsics.add('int8')
+        self.intrinsics.add('int16')
 
     def findSymbol(self, name: str, errroIfNotFound=True) -> Class | None:
         """
@@ -148,6 +176,8 @@ class TypeChecker():
                 return self.evalExpr(node)
             case ast.Assign():
                 return self.evalAssign(node)
+            case ast.AnnAssign():
+                return self.evalAnnAssign(node)
             case ast.Constant():
                 return self.evalConstant(node)
             case ast.AugAssign():
@@ -223,6 +253,10 @@ class TypeChecker():
             return CheckedListNode(node, noneType(), vals)
 
         self.errorInfo.lineNo = node.lineno
+        narrow = next((v.t for v in vals if v.t.isNarrowInt()), None)
+        if narrow is not None:
+            for v in vals:
+                self.coerceLiterals(v, narrow)
         t = vals[0].t
         for i in range(1, len(vals)):
             if not t.isAssignable(vals[i].t):
@@ -301,8 +335,8 @@ class TypeChecker():
 
     def checkIntOnlyOp(self, op, left: Class, right: Class):
         symbol = INT_ONLY_OPS.get(type(op))
-        if symbol is not None and not (left.isInt() and right.isInt()):
-            raiseError(self.errorInfo, f'Operator {symbol} requires int operands, got {left} and {right}')
+        if symbol is not None and not (left.isInteger() and right.isInteger()):
+            raiseError(self.errorInfo, f'Operator {symbol} requires integer operands, got {left} and {right}')
 
     def evalWhile(self, node: ast.While) -> CheckedIfNode:
         """
@@ -404,6 +438,8 @@ class TypeChecker():
             raiseError(self.errorInfo, 'Multiple comperators are not supported')
         left = self.evalNode(node.left)
         right = self.evalNode(node.comparators[0])
+        self.coerceLiterals(right, left.t)
+        self.coerceLiterals(left, right.t)
         op = node.ops[0]
         
         self.errorInfo.lineNo = node.lineno
@@ -447,6 +483,7 @@ class TypeChecker():
                 raiseError(self.errorInfo, f'Empty return is not allowed, function returns type {self.currentFnReturn}')
             return CheckedReturnNode(node, None)
         val = self.evalNode(node.value)
+        self.coerceLiterals(val, self.currentFnReturn)
         if not self.currentFnReturn.isAssignable(val.t):
             raiseError(self.errorInfo, f'Cannot return expression of type {val.t} in function that returns {self.currentFnReturn}')
         
@@ -596,7 +633,7 @@ class TypeChecker():
         # abs/min/max/str/bool are polymorphic: their return type depends on
         # the argument types, so they are type-checked here instead of via
         # their registered (placeholder) FnType.
-        if intrinName in ('abs', 'min', 'max', 'str', 'bool'):
+        if intrinName in POLYMORPHIC_BUILTINS:
             return self.evalPolymorphicBuiltin(node, checked, fnType, intrinName)
         
         params = fnType.asCallable().args
@@ -608,6 +645,7 @@ class TypeChecker():
         argNodes = list[CheckedNode]()
         for i, param in enumerate(params):
             passed = self.evalNode(node.args[i])
+            self.coerceLiterals(passed, param)
             argNodes.append(passed)
             if not param.isAssignable(passed.t):
                 raiseError(self.errorInfo, f'Argument #{i+1} is of type {passed.t} which is not compatible with function parameter of type {param}')
@@ -622,29 +660,43 @@ class TypeChecker():
         self.errorInfo.lineNo = node.lineno
         argNodes = [self.evalNode(a) for a in node.args]
 
-        expectCount = 1 if name in ('abs', 'str', 'bool') else 2
+        expectCount = 2 if name in ('min', 'max') else 1
         if len(argNodes) != expectCount:
             raiseError(self.errorInfo, f"{name}() expects {expectCount} argument{'s' if expectCount != 1 else ''} but {len(argNodes)} {'were' if len(argNodes) != 1 else 'was'} provided")
 
+        t = argNodes[0].t
         if name == 'abs':
-            t = argNodes[0].t
-            if not (t.isInt() or t.isFloat()):
-                raiseError(self.errorInfo, f'abs() argument must be int or float, got {t}')
+            if not (t.isInteger() or t.isFloat()):
+                raiseError(self.errorInfo, f'abs() argument must be an integer or float, got {t}')
             retT = t
         elif name == 'str':
-            t = argNodes[0].t
-            if not (t.isInt() or t.isFloat()):
-                raiseError(self.errorInfo, f'str() argument must be int or float, got {t}')
+            if not (t.isInteger() or t.isFloat()):
+                raiseError(self.errorInfo, f'str() argument must be an integer or float, got {t}')
             retT = self.types['str']
         elif name == 'bool':
-            t = argNodes[0].t
-            if not t.isInt():
-                raiseError(self.errorInfo, f'bool() argument must be int, got {t}')
+            if not t.isInteger():
+                raiseError(self.errorInfo, f'bool() argument must be an integer, got {t}')
             retT = self.types['bool']
+        elif name == 'int':
+            if not (t.isInteger() or t.isFloat()):
+                raiseError(self.errorInfo, f'int() argument must be an integer or float, got {t}')
+            retT = self.types['int']
+        elif name == 'float':
+            if not t.isInteger():
+                raiseError(self.errorInfo, f'float() argument must be an integer, got {t}')
+            retT = self.types['float']
+        elif name in ('int8', 'int16'):
+            # Float to a narrow int would need its own overflow rules; go
+            # through int() instead.
+            if not t.isInteger():
+                raiseError(self.errorInfo, f'{name}() argument must be an integer, got {t}')
+            retT = self.types[name]
         else:  # min / max
+            self.coerceLiterals(argNodes[1], argNodes[0].t)
+            self.coerceLiterals(argNodes[0], argNodes[1].t)
             a, b = argNodes[0].t, argNodes[1].t
-            if not ((a.isInt() and b.isInt()) or (a.isFloat() and b.isFloat())):
-                raiseError(self.errorInfo, f'{name}() arguments must both be int or both be float, got {a} and {b}')
+            if not ((a.isInteger() and a.name == b.name) or (a.isFloat() and b.isFloat())):
+                raiseError(self.errorInfo, f'{name}() arguments must have the same integer type or both be float, got {a} and {b}')
             retT = a
 
         preciseType = FnType(args=[a.t for a in argNodes], returnType=retT)
@@ -661,6 +713,7 @@ class TypeChecker():
         self.errorInfo.lineNo = node.lineno
         left = self.evalNode(node.target)
         right = self.evalNode(node.value)
+        self.coerceLiterals(right, left.t)
         if not left.t.isAssignable(right.t):
             raiseError(self.errorInfo, f'Cannot assign value of type {right.t} to variable of type {left.t}')
         self.checkIntOnlyOp(node.op, left.t, right.t)
@@ -684,13 +737,13 @@ class TypeChecker():
             return CheckedUnaryOpNode(node, operand, node.op)
 
         if isinstance(node.op, (ast.USub, ast.UAdd)):
-            if not (operand.t.isInt() or operand.t.isFloat()):
-                raiseError(self.errorInfo, f'Operand of unary {type(node.op).__name__} is of type {operand.t}, expected int or float')
+            if not (operand.t.isInteger() or operand.t.isFloat()):
+                raiseError(self.errorInfo, f'Operand of unary {type(node.op).__name__} is of type {operand.t}, expected an integer or float')
             return CheckedUnaryOpNode(node, operand, node.op)
 
         if isinstance(node.op, ast.Invert):
-            if not operand.t.isInt():
-                raiseError(self.errorInfo, f'Operand of ~ is of type {operand.t}, expected int')
+            if not operand.t.isInteger():
+                raiseError(self.errorInfo, f'Operand of ~ is of type {operand.t}, expected an integer')
             return CheckedUnaryOpNode(node, operand, node.op)
 
         raiseError(self.errorInfo, f'Unsupported unary operator {type(node.op).__name__}')
@@ -723,7 +776,51 @@ class TypeChecker():
 
         return CheckedNode(node, t)
 
-    def evalAssign(self, node: ast.Assign) -> CheckedNode:
+    def evalAnnAssign(self, node: ast.AnnAssign) -> CheckedNode:
+        """
+        w: list[int8] = [3, -1, 7]
+        Declares a variable with the annotated type instead of the type of
+        the value, so integer literals can be int8/int16.
+        """
+        self.errorInfo.lineNo = node.lineno
+        if node.value is None:
+            raiseError(self.errorInfo, 'An annotated variable needs a value')
+        if not isinstance(node.target, ast.Name):
+            raiseError(self.errorInfo, 'Only plain names can be annotated')
+        declaredType = self.evalType(node.annotation)
+        assign = ast.copy_location(ast.Assign(targets=[node.target], value=node.value), node)
+        return self.evalAssign(assign, declaredType)
+
+    def coerceLiterals(self, node: CheckedNode, target: Class):
+        """
+        Give integer literals the narrow integer type their context needs:
+            x: int8 = -5
+            w: list[int8] = [1, 2, 3]
+            y = x + 1         # x is int8, so 1 is int8 too
+        A literal that does not fit is an error. Anything else is left for
+        the usual type checks to accept or reject.
+        """
+        if target.isNarrowInt() and node.t.isInt():
+            value = literalInt(node.base)
+            if value is None:
+                return
+            bits = target.intBits()
+            if not -(1 << (bits - 1)) <= value < (1 << (bits - 1)):
+                raiseError(self.errorInfo, f'Integer literal {value} does not fit in {target}')
+            node.t = target
+            if isinstance(node, CheckedUnaryOpNode):
+                node.operand.t = target
+        elif target.isList() and isinstance(node, CheckedListNode):
+            base = target.asList().base
+            if not node.vals:
+                node.t = target
+            elif base.isNarrowInt():
+                for v in node.vals:
+                    self.coerceLiterals(v, base)
+                if all(v.t.name == base.name for v in node.vals):
+                    node.t = ListType(None, base)
+
+    def evalAssign(self, node: ast.Assign, declaredType: Class | None = None) -> CheckedNode:
         """
         a = 10
         my_list[0] = 5
@@ -741,6 +838,7 @@ class TypeChecker():
             # element type.
             left = self.evalSubscript(target)
             self.errorInfo.lineNo = node.lineno
+            self.coerceLiterals(right, left.t)
             if not left.t.isAssignable(right.t):
                 raiseError(self.errorInfo, f'Cannot assign value of type {right.t} to element of type {left.t}')
             return CheckedAssignNode(node, left, right, [])
@@ -751,8 +849,14 @@ class TypeChecker():
         name = target.id
         declared = list[str]()
         sym = self.findSymbol(name, False)
+        if declaredType is not None:
+            if sym is not None and str(sym) != str(declaredType):
+                raiseError(self.errorInfo, f'{name} is already declared as {sym}')
+            self.coerceLiterals(right, declaredType)
+        elif sym is not None:
+            self.coerceLiterals(right, sym)
         if sym is None:
-            self.symbols[-1][name] = right.t
+            self.symbols[-1][name] = declaredType if declaredType is not None else right.t
             declared.append(name)
 
         left = self.evalNode(target)
@@ -783,6 +887,8 @@ class TypeChecker():
         self.errorInfo.lineNo = node.lineno
         left = self.evalNode(node.left)
         right = self.evalNode(node.right)
+        self.coerceLiterals(right, left.t)
+        self.coerceLiterals(left, right.t)
 
         # int * str -> str (commutative string repetition)
         if isinstance(node.op, ast.Mult) and left.t.isInt() and right.t.name == 'str':

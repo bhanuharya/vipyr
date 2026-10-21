@@ -784,14 +784,20 @@ class LLVMBackend():
             ast.Mod: (self.builder.frem, self.builder.srem)
         }
 
-        if t.isInt():
+        if t.isInteger():
             match bop:
                 case ast.Div() | ast.Mod():
                     return self.doIntDivRem(left, right, isinstance(bop, ast.Mod))
                 case ast.FloorDiv():
                     return self.doIntFloorDiv(left, right)
                 case ast.Pow():
-                    return self.builder.call(self.symbols[0]['pyr_ipow'].ptr, [left, right])
+                    # The runtime works on int; narrow results are the same
+                    # value modulo 2^bits.
+                    intT = ir.IntType(REGISTER_SIZE)
+                    res = self.builder.call(self.symbols[0]['pyr_ipow'].ptr,
+                                            [self.doIntResize(left, intT),
+                                             self.doIntResize(right, intT)])
+                    return self.doIntResize(res, left.type)
                 case ast.BitAnd():
                     return self.builder.and_(left, right)
                 case ast.BitOr():
@@ -799,11 +805,11 @@ class LLVMBackend():
                 case ast.BitXor():
                     return self.builder.xor(left, right)
                 case ast.LShift() | ast.RShift():
-                    # Like RISC-V sll/sra, use only the low 5 bits of the
-                    # count. This also keeps LLVM shl/ashr defined: they
-                    # are poison for counts >= 32. The mask costs nothing
-                    # on RISC-V, where the shift instructions ignore the
-                    # upper bits anyway.
+                    # Take the count modulo the width; for int that is the
+                    # low 5 bits, as RISC-V sll/sra use. This also keeps LLVM
+                    # shl/ashr defined: they are poison for counts >= the
+                    # width. For int the mask costs nothing on RISC-V, where
+                    # the shift instructions ignore the upper bits anyway.
                     count = self.builder.and_(right, ir.Constant(right.type, right.type.width - 1))
                     if isinstance(bop, ast.LShift):
                         return self.builder.shl(left, count)
@@ -1033,10 +1039,20 @@ class LLVMBackend():
         return self.builder.sitofp(val, retType.toLLVM())
     
     def doIntCast(self, args: list[CheckedNode], retType: Class) -> ir.Value:
+        """int(x), int8(x), int16(x)."""
         assert len(args) == 1
         val = self.evalNode(args[0], False)
-        
-        return self.builder.fptosi(val, retType.toLLVM())
+        if args[0].t.isFloat():
+            return self.builder.fptosi(val, retType.toLLVM())
+        return self.doIntResize(val, retType.toLLVM())
+
+    def doIntResize(self, val: ir.Value, intT: ir.IntType) -> ir.Value:
+        """Sign-extend or wrap an integer to another width."""
+        if val.type.width < intT.width:
+            return self.builder.sext(val, intT)
+        if val.type.width > intT.width:
+            return self.builder.trunc(val, intT)
+        return val
 
     def doStr(self, args: list[CheckedNode]) -> ir.Value:
         """str(int) or str(float): convert to string via sprintf."""
@@ -1046,10 +1062,11 @@ class LLVMBackend():
         from .type import ListType, Class
         str_t = ListType("str", Class('char'))
         strT = str_t.toLLVM()
-        if arg.t.isInt():
+        if arg.t.isInteger():
             # Max i32 is -2147483648 (11 chars + NUL = 12 bytes)
             buf = self.heapAlloc(ir.IntType(8), 12)
             fmt = self.getConstString('%d')
+            val = arg.t.getPrintfArgument(self.builder, val)
             self.builder.call(self.symbols[0]['sprintf'].ptr, [buf, fmt, val])
             strlen = self.symbols[0]['strlen'].ptr
             length = self.builder.call(strlen, [buf])
@@ -1069,16 +1086,17 @@ class LLVMBackend():
         assert len(args) == 1
         val = self.evalNode(args[0], False)
         # icmp returns i1, which is the LLVM representation of bool
-        return self.builder.icmp_signed('!=', val, self.getConstant(0, 32))
+        return self.builder.icmp_signed('!=', val, ir.Constant(val.type, 0))
 
     def doAbs(self, args: list[CheckedNode]) -> ir.Value:
         """abs(int) or abs(float)."""
         assert len(args) == 1
         arg = args[0]
         val = self.evalNode(arg, False)
-        if arg.t.isInt():
-            neg = self.builder.sub(self.getConstant(0, 32), val)
-            is_neg = self.builder.icmp_signed('<', val, self.getConstant(0, 32))
+        if arg.t.isInteger():
+            zero = ir.Constant(val.type, 0)
+            neg = self.builder.sub(zero, val)
+            is_neg = self.builder.icmp_signed('<', val, zero)
             return self.builder.select(is_neg, neg, val)
         if arg.t.isFloat():
             zero = ir.Constant(ir.DoubleType(), 0.0)
@@ -1103,7 +1121,7 @@ class LLVMBackend():
         assert len(args) == 2
         a = self.evalNode(args[0], False)
         b = self.evalNode(args[1], False)
-        if args[0].t.isInt() and args[1].t.isInt():
+        if args[0].t.isInteger() and args[1].t.isInteger():
             op = '>' if is_max else '<'
             cond = self.builder.icmp_signed(op, a, b)
             return self.builder.select(cond, a, b)
@@ -1126,7 +1144,7 @@ class LLVMBackend():
                 return self.doRange(node.args, node.fnType.asCallable().returnType)
             case 'float':
                 return self.doFloatCast(node.args, node.fnType.asCallable().returnType)
-            case 'int':
+            case 'int' | 'int8' | 'int16':
                 return self.doIntCast(node.args, node.fnType.asCallable().returnType)
             case 'str':
                 return self.doStr(node.args)

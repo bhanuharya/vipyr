@@ -92,6 +92,28 @@ a >>= 1
     def test_continue_in_loops(self):
         typecheck_source('for i in range(3):\n    continue\nwhile False:\n    continue\n')
 
+    def test_narrow_ints(self):
+        # Integer literals take the int8/int16 type their context needs.
+        src = '''
+w: list[int8] = [12, -3, 7, -128, 127]
+e: list[int16] = []
+x: int8 = -128
+y = x + 1
+y += 2
+ok = y < 5
+def f(a: int8, b: int16) -> int8:
+    return a * 2
+z = f(100, 30000)
+w[0] = 5
+m = max(x, 0) + min(1, x)
+n = int(x) + int(int16(5)) + int(2.5)
+v = [x, 1, 2]
+q = int8(300) + int8(int16(-1)) + int8(int(1.5)) + int8(n)
+r = float(x) + float(int16(3))
+print(str(x), bool(x), abs(x), -x, ~x, x >> 1, x ** 2, x // 3)
+'''
+        typecheck_source(src)
+
 
 class TestTypeCheckerRejects(unittest.TestCase):
     def assert_compile_error(self, src, *fragments):
@@ -132,7 +154,7 @@ class TestTypeCheckerRejects(unittest.TestCase):
         ]
         for src, symbol in cases:
             with self.subTest(src=src):
-                self.assert_compile_error(src, f'Operator {symbol} requires int operands')
+                self.assert_compile_error(src, f'Operator {symbol} requires integer operands')
 
     def test_invert_of_float_rejected(self):
         self.assert_compile_error('a = ~1.5\n', 'Operand of ~')
@@ -198,6 +220,29 @@ class TestTypeCheckerRejects(unittest.TestCase):
     def test_int_times_list_rejected(self):
         self.assert_compile_error('a = [1]\nb = 2 * a\n', 'binary operation')
 
+    def test_narrow_int_errors(self):
+        cases = [
+            ('x: int8 = 128\n', 'does not fit in int8'),
+            ('x: int8 = -129\n', 'does not fit in int8'),
+            ('x: int16 = 40000\n', 'does not fit in int16'),
+            ('w: list[int8] = [1, 300]\n', 'does not fit in int8'),
+            ('x: int8 = 1\nx = 200\n', 'does not fit in int8'),
+            ('def f(a: int8) -> int:\n    return 0\nf(999)\n', 'does not fit in int8'),
+            # No implicit conversion between integer types.
+            ('x: int8 = 1\nn = 2\ny = x + n\n', 'binary operation'),
+            ('x: int8 = 1\nn = 2\ny = x << n\n', 'binary operation'),
+            ('n = 2\nx: int8 = n\n', 'Cannot assign'),
+            ('x: int8 = 1\ny: int16 = 1\nz = x == y\n', 'comparison'),
+            ('x: int8 = 1\nn = 2\nm = max(x, n)\n', 'same integer type'),
+            ('x = int8(1.5)\n', 'int8() argument must be an integer'),
+            ('x = float(2.5)\n', 'float() argument must be an integer'),
+            ('x: int = 1\nx: int8 = 2\n', 'already declared as int'),
+            ('x: int8\n', 'needs a value'),
+        ]
+        for src, fragment in cases:
+            with self.subTest(src=src):
+                self.assert_compile_error(src, fragment)
+
 
 class TestOracleSemantics(unittest.TestCase):
     def test_int_division_is_truncating(self):
@@ -259,6 +304,40 @@ class TestOracleSemantics(unittest.TestCase):
         out, status = oracle_output('print(1 << 33, 1 << -1, 1 << 31, -8 >> 1, -8 >> 33, 5 >> 32)\n')
         self.assertEqual(status, 0)
         self.assertEqual(out, '2 -2147483648 -2147483648 -4 -4 5\n')
+
+    def test_int8_wraps(self):
+        src = '''
+x: int8 = 127
+x += 1
+y: int8 = 16
+print(x, y * 9, -x, abs(x), x - 1, int(x) - 1)
+'''
+        out, status = oracle_output(src)
+        self.assertEqual(status, 0)
+        self.assertEqual(out, '-128 -112 -128 -128 127 -129\n')
+
+    def test_int16_wraps(self):
+        out, status = oracle_output('a: int16 = 300\nb: int16 = -32768\nprint(a * a, b - 1, b / -1)\n')
+        self.assertEqual(status, 0)
+        self.assertEqual(out, '24464 32767 -32768\n')
+
+    def test_narrow_conversions(self):
+        out, status = oracle_output('print(int8(200), int8(-129), int16(70000), int(int8(-1)), float(int8(-3)))\n')
+        self.assertEqual(status, 0)
+        self.assertEqual(out, '-56 127 4464 -1 -3.000000\n')
+
+    def test_narrow_division_pow_and_shifts(self):
+        # Division is total at every width; shift counts are taken modulo
+        # the width; ** wraps.
+        src = '''
+m: int8 = -128
+print(m / -1, m % -1, m / 0, m % 0, m // 0)
+print(int8(1) << 9, m >> 9, m >> -1, int16(1) << 17)
+print(int8(37) ** 3, m ** 3, int8(2) ** -1)
+'''
+        out, status = oracle_output(src)
+        self.assertEqual(status, 0)
+        self.assertEqual(out, '-128 0 -1 -128 -1\n2 -64 -1 2\n-35 0 0\n')
 
     def test_bitwise_and_invert(self):
         out, status = oracle_output('print(-6 & 3, -6 | 3, -6 ^ 3, ~0, ~-1, ~2147483647)\n')

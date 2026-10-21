@@ -122,13 +122,15 @@ Buildroot GCC driver.
 The implementation currently covers a restricted, typed subset of Python:
 
 - `int`, `float`, `bool`, `str`, and lists
-- assignments and augmented assignments
-- arithmetic and comparisons
+- `int8` and `int16`, for packed data such as neural-network weights
+- assignments, annotated assignments (`w: list[int8] = [1, -2]`), and
+  augmented assignments
+- arithmetic, bitwise operators, shifts, and comparisons
 - boolean `and` and `or`
-- `if`, `while`, `for`, and `break`
+- `if`, `while`, `for`, `break`, and `continue`
 - functions, parameters, and `return`
 - `print`, `input`, `len`, and `range`
-- `float()`, `int()`, `str()`, and `bool()` conversions
+- `float()`, `int()`, `int8()`, `int16()`, `str()`, and `bool()` conversions
 - `abs()`, `min()`, and `max()`
 - string concatenation (`+`) and repetition (`*`)
 - list construction, iteration, indexing, and element assignment

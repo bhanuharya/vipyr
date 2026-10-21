@@ -6,6 +6,10 @@ import llvmlite.ir as ir
 
 sliceTypes: dict[str, ir.Type] = dict()
 
+# Integer types and their widths. `int` is the register-sized default; the
+# narrower ones are for packed data such as int8 neural-network weights.
+INT_BITS = {'int': REGISTER_SIZE, 'int8': 8, 'int16': 16}
+
 def noneType() -> Class:
     return Class('<None>')
 
@@ -47,11 +51,23 @@ class Class():
         return self.name == 'int'
     def isFloat(self) -> bool:
         return self.name == 'float'
+
+    def isInteger(self) -> bool:
+        """int or one of the narrower integer types."""
+        return self.name in INT_BITS
+
+    def isNarrowInt(self) -> bool:
+        return self.isInteger() and not self.isInt()
+
+    def intBits(self) -> int:
+        return INT_BITS[self.name]
     
     def getTypeSize(self) -> int:
         match self.name:
             case 'int' | 'float':
                 return REGISTER_SIZE // 8
+            case 'int8' | 'int16':
+                return self.intBits() // 8
             case 'bool':
                 return 1
             case _:
@@ -90,8 +106,8 @@ class Class():
     
     def toLLVM(self) -> ir.Type:
         match self.name:
-            case 'int':
-                return ir.IntType(REGISTER_SIZE)
+            case 'int' | 'int8' | 'int16':
+                return ir.IntType(self.intBits())
             case 'float':
                 if REGISTER_SIZE == 64:
                     return ir.DoubleType()
@@ -126,7 +142,7 @@ class Class():
 
     def getPrintfFormat(self) -> str:
         match self.name:
-            case 'int':
+            case 'int' | 'int8' | 'int16':
                 return '%d'
             case 'float':
                 return '%f'
@@ -143,9 +159,10 @@ class Class():
     def getPrintfArgument(self, builder: ir.IRBuilder, llvmV: ir.Value) -> ir.Value:
         """
         Take the evaluated llvm argument and give it in a proper form for printf.
-        Doesn't do anything in base type
+        Narrow integers are sign-extended, as C varargs promote them to int.
         """
-        _ = builder
+        if self.isNarrowInt():
+            return builder.sext(llvmV, ir.IntType(REGISTER_SIZE))
         return llvmV
 
 

@@ -17,6 +17,7 @@ The following types exist:
 | Type    | Representation      | Notes                                  |
 |---------|---------------------|----------------------------------------|
 | `int`   | 32-bit two's-complement | Arithmetic wraps (LLVM `i32`).      |
+| `int8`, `int16` | 8/16-bit two's-complement | Wrap at their own width; see §1.3. |
 | `float` | IEEE-754 double     | LLVM `double`.                         |
 | `bool`  | 1-bit               | Distinct from `int` (unlike CPython).  |
 | `str`   | length + byte buffer | Immutable-ish; see §6.                |
@@ -50,17 +51,61 @@ Currently the only subtyping edge is `str <: list[char]`. There is **no**
 implicit numeric conversion: `int` and `float` are unrelated, and `bool` is
 not a subtype of `int`.
 
+A variable can also be declared with an annotation, which fixes its type to
+the annotation instead of the type of the value:
+
+```
+x: int8 = 5         # x : int8
+w: list[int8] = []  # empty list of int8
+x: int16 = 7        # rejected: x is already declared as int8
+```
+
 ### 1.2 Conversions
 
 Explicit conversions are provided as builtins:
 
 ```
-float(3)      # 3.0   (int -> float, exact for |x| < 2^53)
+float(3)      # 3.0   (integer -> float, exact for |x| < 2^53)
 int(3.9)      # 3     (float -> int, truncates toward zero)
+int(x)        # sign-extends an int8/int16 to int
+int8(200)     # -56   (integer -> int8/int16 keeps the low bits: wraps)
 ```
+
+`int8()` and `int16()` take integers only; convert a float with
+`int8(int(f))`.
 
 `int()` on a float truncates toward zero (matches `fptosi` and CPython's
 `int(float)`). Out-of-range conversion is undefined behavior.
+
+### 1.3 Narrow integers
+
+`int8` and `int16` exist for packed data: a `list[int8]` stores one byte
+per element, so four elements fit in one 32-bit word. They follow every
+`int` rule (wrapping arithmetic, total division, the operators of §2.1) at
+their own width, so `int8` arithmetic wraps modulo 2^8:
+
+```
+x: int8 = 127
+x + 1              # -128
+int(x) + 1         # 128: widen first to compute in int
+```
+
+There is still no implicit conversion between integer types: `x + n` with
+`x: int8` and `n: int` is a compile error. Integer *literals* are the
+exception. A literal (or a negated literal) takes the narrow type its
+context needs, when the value fits:
+
+```
+w: list[int8] = [12, -3, 7]   # each literal is an int8
+y = x + 1                     # 1 is an int8, because x is
+f(100)                        # an int8 parameter accepts the literal 100
+z: int8 = 128                 # rejected: does not fit in int8
+```
+
+The contexts are annotated and plain assignment to an existing variable or
+list element, function arguments, `return`, both operands of a binary
+operator or comparison, `min`/`max` arguments, and list literals that
+contain a narrow value.
 
 ## 2. Expressions and operators
 
@@ -68,7 +113,7 @@ int(3.9)      # 3     (float -> int, truncates toward zero)
 
 `+`, `-`, `*`, `/`, `%` are supported. Both operands must have the same
 type; there is no implicit promotion. `//`, `**`, `&`, `|`, `^`, `<<`, and
-`>>` are supported on `int` only (see below).
+`>>` are supported on integer types only (see below).
 
 * **int**: `+`, `-`, `*` wrap modulo 2^32. `/` is **truncating integer
   division** and `%` is the **signed remainder** (C `sdiv`/`srem`
@@ -104,8 +149,9 @@ For `float`, division by zero gives the IEEE result (`inf`, `-inf`, or
 dividend, *not* CPython's floor modulo (`-7.0 % 3.0 == -1.0`; CPython gives
 `2.0`).
 
-**int-only operators.** Every one is a total function: no input traps or is
-undefined.
+**Integer-only operators.** Every one is a total function: no input traps or
+is undefined. The examples are for `int`; `int8` and `int16` behave the same
+at their width (`int8(-128) // -1 == -128`).
 
 * `//` is CPython floor division (`-7 // 2 == -4`), unlike the truncating
   `/`. `x // 0 == -1`, as for `/`, and `-2147483648 // -1` wraps to
@@ -118,20 +164,23 @@ undefined.
 * `<<` and arithmetic `>>` use only the low 5 bits of the shift count, as
   RISC-V `sll`/`sra` (and Java) do: `1 << 33 == 2`, `1 << -1 ==
   -2147483648`, `-8 >> 1 == -4`. `<<` wraps modulo 2^32. Unmasked, LLVM
-  `shl`/`ashr` would be poison for counts of 32 or more.
+  `shl`/`ashr` would be poison for counts of 32 or more. In general the
+  count is taken modulo the bit width, so for `int8` only its low 3 bits
+  count (`int8(1) << 9 == 2`).
 
 ### 2.2 Comparisons
 
-`==`, `!=`, `<`, `<=`, `>`, `>=` are supported on `int`, `float`, and `bool`
-(operands of equal type). Chained comparisons are **not** supported.
+`==`, `!=`, `<`, `<=`, `>`, `>=` are supported on the integer types,
+`float`, and `bool` (operands of equal type). Chained comparisons are **not** supported.
 
 `str` supports only `==` and `!=` (length comparison followed by byte-wise
 `memcmp`).
 
 ### 2.3 Unary operators
 
-`+x`, `-x` on `int`/`float`; `~x` (bitwise not, `-x - 1`) on `int`;
-`not b` on `bool`. Integer negation wraps.
+`+x`, `-x` on integers and `float`; `~x` (bitwise not, `-x - 1`) on
+integers; `not b` on `bool`. Integer negation wraps (`-int8(-128) ==
+-128`).
 
 ### 2.4 Boolean operators
 
@@ -185,13 +234,14 @@ definition, `return`, expression statements.
 | `input`  | `input(prompt: str) -> str` | Writes prompt, reads one line.         |
 | `len`    | `len(x) -> int`  | Element count of a list or string.             |
 | `range`  | `range(n: int) -> list[int]` | List `[0, 1, …, n-1]`.                 |
-| `float`  | `float(int) -> float` | See §1.2.                                 |
-| `int`    | `int(float) -> int`   | See §1.2.                                 |
-| `str`    | `str(int) -> str`, `str(float) -> str` | See §5.2.                    |
-| `bool`   | `bool(x: int) -> bool` | `0 → False`, non-zero → `True`.           |
-| `abs`    | `abs(int) -> int`, `abs(float) -> float` | Absolute value.          |
-| `min`    | `min(a, b)` (both `int` or both `float`) | Returns the smaller; result type matches the arguments. On a tie returns `a`. |
-| `max`    | `max(a, b)` (both `int` or both `float`) | Returns the larger; result type matches the arguments. On a tie returns `a`. |
+| `float`  | `float(integer) -> float` | See §1.2.                             |
+| `int`    | `int(float or integer) -> int` | See §1.2.                        |
+| `int8`, `int16` | `int8(integer) -> int8` | Wraps; see §1.2.                 |
+| `str`    | `str(integer) -> str`, `str(float) -> str` | See §5.2.                |
+| `bool`   | `bool(x: integer) -> bool` | `0 → False`, non-zero → `True`.       |
+| `abs`    | `abs(integer)`, `abs(float)` | Absolute value, same type. `abs` of the most negative value wraps to itself. |
+| `min`    | `min(a, b)` (same integer type or both `float`) | Returns the smaller; result type matches the arguments. On a tie returns `a`. |
+| `max`    | `max(a, b)` (same integer type or both `float`) | Returns the larger; result type matches the arguments. On a tie returns `a`. |
 
 ### 5.1 `print` formatting
 
@@ -264,7 +314,8 @@ concatenated, or stored like any other string.
 6. **No truthiness** — conditions and `and`/`or` operands must be `bool`.
 7. **32-bit `int`** with wraparound, not arbitrary precision. Shift counts
    use only their low 5 bits, and `**` with a negative exponent stays an
-   `int` (CPython returns a `float`).
+   `int` (CPython returns a `float`). `int8` and `int16` do not exist in
+   CPython; they come from typed numeric code such as NumPy's.
 8. **No runtime errors for** out-of-range indexing or out-of-range
    `int(float)` — these are undefined behavior.
    Exception: with `--bounds-check`, out-of-range/negative subscripts are a

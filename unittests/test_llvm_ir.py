@@ -121,6 +121,37 @@ print(f(7, 2))
         llvm.parse_assembly(ir_text_for(self.SRC)).verify()
 
 
+class TestNarrowInts(unittest.TestCase):
+    SRC = '''
+def dot(a: list[int8], b: list[int8], s: int8) -> int:
+    acc = 0
+    for i in range(len(a)):
+        acc = acc + int(a[i]) * int(b[i])
+    t = a[0] * b[0] + (a[1] << s) + a[2] ** s
+    return acc + int(t)
+w: list[int8] = [1, -2, 3, -4]
+print(dot(w, w, 1))
+'''
+
+    def test_lists_are_packed_bytes(self):
+        self.assertIn('%"list[int8]" = type {i32, i8*}', ir_text_for(self.SRC))
+
+    def test_arithmetic_stays_at_eight_bits(self):
+        ir = ir_text_for(self.SRC)
+        self.assertRegex(ir, r'mul i8 ')
+        self.assertRegex(ir, r'sext i8 .* to i32')
+
+    def test_shift_count_masked_to_width(self):
+        mod = llvm.parse_assembly(ir_text_for(self.SRC))
+        shifts = [ins for fn in mod.functions for bb in fn.blocks
+                  for ins in bb.instructions if ins.opcode == 'shl']
+        self.assertEqual(len(shifts), 1)
+        self.assertRegex(str(list(shifts[0].operands)[1]).strip(), r'= and i8 .*, 7$')
+
+    def test_module_verifies(self):
+        llvm.parse_assembly(ir_text_for(self.SRC)).verify()
+
+
 class TestIRVerifies(unittest.TestCase):
     def test_verify_accepts(self):
         src = '''

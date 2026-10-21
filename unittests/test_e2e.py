@@ -272,6 +272,35 @@ print(x)
         self.check_equivalence(src)
         self.check_equivalence(src, passes=DEFAULT_PASSES)
 
+    def test_narrow_ints(self):
+        # Edge cases go through arguments so constant folding can't hide
+        # the generated code.
+        src = '''
+def edge(m: int8, k: int8, s: int8) -> int:
+    print(m / k, m % k, -m, abs(m), m // 0, int8(1) << s, m >> s, m ** 3, str(m), bool(m))
+    print(max(m, 0), min(m, k), ~m, m & 15, m ^ k, m | 3, m * k, m + k, m - k)
+    return 0
+
+def wide(a: int16, b: int16) -> int16:
+    return a * b
+
+def dot(a: list[int8], b: list[int8]) -> int:
+    acc = 0
+    for i in range(len(a)):
+        acc = acc + int(a[i]) * int(b[i])
+    return acc
+
+edge(-128, -1, 9)
+edge(37, 5, 3)
+edge(127, 127, 7)
+print(wide(300, 300), wide(-32768, -1), int(wide(181, 181)))
+w: list[int8] = [12, -3, 7, -128, 127]
+v: list[int8] = [-128, -128, 127, -128, 127]
+print(dot(w, v), int8(200), int16(70000), float(w[3]))
+'''
+        self.check_equivalence(src)
+        self.check_equivalence(src, passes=DEFAULT_PASSES)
+
     def test_continue(self):
         src = '''
 def count(n: int) -> int:
