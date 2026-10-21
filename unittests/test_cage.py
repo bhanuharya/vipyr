@@ -161,14 +161,14 @@ class TestCage(unittest.TestCase):
         for name, why in cases.items():
             with self.subTest(candidate=name):
                 failed = self.failed(self.judge(name))
-                self.assertIn(why, failed['no memory'])
+                self.assertIn(why, failed['no state'])
                 self.assertIn('not attempted', failed['equivalence'])
 
     def test_extra_ports_are_rejected(self):
         self.assertIn("extra input port 'clk'", self.failed(self.judge('time_bomb'))['interface'])
         failed = self.failed(self.judge('spy_port'))
         self.assertIn("extra output port 'debug'", failed['interface'])
-        self.assertNotIn('no memory', failed)
+        self.assertNotIn('no state', failed)
 
     def test_undefined_bits_cannot_pass(self):
         # An output left as x must not count as matching the answer key.
@@ -183,7 +183,7 @@ class TestCage(unittest.TestCase):
         path = self.tmp / 'divides.v'
         path.write_text('module accel (input [31:0] a, input [31:0] b, output [31:0] result);\n'
                         '  assign result = a / b;\nendmodule\n')
-        self.assertIn('$div', self.failed(cage.judge(str(path), self.key))['no memory'])
+        self.assertIn('$div', self.failed(cage.judge(str(path), self.key))['no state'])
 
     def test_unparseable_verilog_is_rejected(self):
         path = self.tmp / 'broken.v'

@@ -100,7 +100,7 @@ python -m src.cage examples/cage/pid.py q15mul examples/cage/candidates/*.v
 checks candidate circuits for a custom instruction that would replace
 `q15mul`, the hot function of a fixed-point PID controller. The answer key
 comes from the compiler's IR, never from whoever wrote the circuit, and a
-circuit is accepted only with the right interface, no memory, and a Z3 proof
+circuit is accepted only with the right interface, no state, and a Z3 proof
 that it matches for every input. The candidates include a backdoor, a time
 bomb and a subtle saturation bug; all are rejected. An accepted circuit gets
 a certificate, and with it the compiler turns every call into one custom

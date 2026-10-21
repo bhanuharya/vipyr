@@ -8,16 +8,23 @@ Verilog itself:
 
     interface    exactly two 32-bit inputs, a and b, and one 32-bit output,
                  result: two numbers in, one number out, no other wires
-    no memory    only combinational cells and no logic loops: no flip-flops,
-                 latches, memories or debug outputs, and no gates wired into
-                 a latch, so it cannot remember earlier inputs or count its
-                 way to a time bomb
+    no state     only allowlisted combinational cells and no logic loops: no
+                 flip-flops, latches, memories or debug outputs, and no gates
+                 wired into a latch. With the interface rule, the circuit has
+                 no persistent state and no access beyond its declared inputs
+                 and output, so it cannot count its way to a time bomb
     equivalence  Z3 proves result equal to the answer key (src/spec.py), taken
                  from the compiler, for every one of the 2^64 input pairs
 
 Yosys turns the Verilog into a netlist for the first two checks. Only a
-circuit that passes both is turned into an SMT formula for the third. Undriven wires and undefined (x) bits become
-free variables, so a circuit cannot pass by leaving its output unspecified.
+circuit that passes both is turned into an SMT formula for the third.
+Undriven wires and undefined (x) bits become free variables, so a circuit
+cannot pass by leaving its output unspecified. A proof that times out counts
+as a failure.
+
+The checks cover the circuit only. Placing it in a processor safely needs a
+trusted wrapper that owns decoding, destination registers, write enables and
+handshakes (docs/cage.md); that wrapper is not built yet.
 
 Command line:
 
@@ -169,10 +176,10 @@ def check_stateless(module: dict, problems: list[str]) -> Check:
             bad[cell['type']] = bad.get(cell['type'], 0) + 1
     if bad:
         found = ', '.join(f'{n} x {t}' for t, n in sorted(bad.items()))
-        return Check('no memory', False, f'cells outside the combinational allowlist: {found}')
+        return Check('no state', False, f'cells outside the combinational allowlist: {found}')
     if problems:
-        return Check('no memory', False, '; '.join(problems))
-    return Check('no memory', True, 'combinational logic only, no loops')
+        return Check('no state', False, '; '.join(problems))
+    return Check('no state', True, 'combinational logic only, no loops')
 
 
 def check_equivalence(smt2: str, spec: specs.Spec, top: str = TOP,

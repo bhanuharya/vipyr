@@ -2,9 +2,13 @@
 
 An AI agent can propose a circuit for a custom RISC-V instruction, but
 nothing it writes is trusted. The compiler supplies the answer key, and the
-cage accepts a circuit only if three mechanical checks pass. The agent may
-be wrong, or it may have been tricked by a prompt injection into planting a
-backdoor; either way, a bad circuit is rejected before it reaches the chip.
+cage accepts a circuit only if three mechanical checks pass. A circuit that
+fails a check is rejected whether its fault is a mistake or a planted
+backdoor: an equivalence proof does not depend on intent.
+
+The cage restricts what the agent controls to one thing, the arithmetic
+function. It checks that function; it does not yet place it in a processor
+(see [What is trusted, and what is not covered](#what-is-trusted-and-what-is-not-covered)).
 
 ## Try it
 
@@ -22,12 +26,12 @@ answer key: pid.q15mul(i16, i16) -> i16, from the compiler's IR
 
 backdoor.v: REJECTED
   pass  interface    inputs a, b and output result, 32 bits each
-  pass  no memory    combinational logic only, no loops
+  pass  no state     combinational logic only, no loops
   FAIL  equivalence  differs at a=0x00001337, b=0x00000042: required 0x0000000a, got 0x00007fff
 ...
 honest.v: ACCEPTED
   pass  interface    inputs a, b and output result, 32 bits each
-  pass  no memory    combinational logic only, no loops
+  pass  no state     combinational logic only, no loops
   pass  equivalence  equal to the answer key for all 2^64 input pairs
 ```
 
@@ -38,13 +42,19 @@ All eight candidates are checked in a few seconds.
 | Rule | What it stops | Candidate it rejects |
 | --- | --- | --- |
 | **Interface**: exactly inputs `a`, `b` and output `result`, 32 bits each | Leaking data through extra wires; depending on a clock or anything else | `spy_port.v` (an extra `debug` output), `time_bomb.v` (a `clk` input) |
-| **No memory**: only combinational cells, and no logic loops | Remembering earlier inputs: time bombs, covert channels | `time_bomb.v` (a flip-flop), `hidden_latch.v` (a latch), `gate_loop.v` (two gates wired into a latch) |
+| **No state**: only allowlisted combinational cells, and no logic loops | Remembering earlier inputs: hidden counters, time bombs, covert channels | `time_bomb.v` (a flip-flop), `hidden_latch.v` (a latch), `gate_loop.v` (two gates wired into a latch) |
 | **Equivalence**: equal to the answer key for every input | Wrong results, including a backdoor that fires on one secret input | `no_saturation.v` (wrong only for -1 × -1), `backdoor.v` (full torque on one trigger value) |
 
-The rules support each other. Because the circuit has no memory, its output
-depends only on `a` and `b`, so checking every pair of inputs covers every
-behaviour it can have. That makes the equivalence proof complete, not
-bounded by a number of cycles.
+The rules support each other. Together, the first two mean the circuit is
+purely combinational, with no persistent state and no access beyond its
+declared inputs and output. Its result then depends only on `a` and `b`, so
+checking every pair of inputs covers every behaviour it can have: the
+guarantee is not limited to a finite execution horizon. The solver can still
+time out, and a candidate without a proof is rejected.
+
+The output separates structural rejections (interface, no state) from proof
+failures (equivalence), and the examples are evidence for the checks, not a
+proof that every attack is caught.
 
 Testing would not catch the two equivalence failures. `no_saturation.v` is
 wrong for one int16 input pair out of 2^32; `backdoor.v` is wrong for one
@@ -120,25 +130,50 @@ the compiler's replacement of each call (`doCustomInstruction` in
 `src/llvm.py`) and, under QEMU, the emulation handler in `runtime.c`. The
 agent's output is not among them.
 
+The agent cannot weaken acceptance through these: it supplies one Verilog
+file, and the answer key, the cage's rules, the proof setup and the
+certificate checks all run in the toolchain. An agent loop must keep it that
+way: the agent returns text and gets no write access to the repository.
+
 Not covered yet:
 
-- **Integration into a core.** The plan is to place accepted circuits behind
-  a fixed coprocessor port (CV-X-IF on an open core such as CV32E40X) that is
-  checked once by people, so the agent never edits the processor itself.
-- **Physical side channels**, such as power draw. A circuit with no memory
-  and a fixed latency has no timing channel of its own, but power analysis
-  is out of scope.
+- **Integration into a core.** A coprocessor interface such as CV-X-IF (on
+  CV32E40X) provides connectivity, not containment: it carries register
+  reads, memory transactions and results that can signal exceptions. The
+  plan is a trusted wrapper that owns instruction decoding, transaction
+  identifiers, destination registers, write enables, handshakes and
+  cancellation, and passes the generated function only its operands. Per-
+  proposal proofs can stay local only once a reusable proof shows how any
+  circuit that passes the cage composes with that wrapper and the core. The
+  core's own correctness would remain an explicit assumption.
+- **Timing and physical side channels.** The wrapper would enforce operand-
+  independent interface timing, under stated assumptions. Timing, power and
+  electromagnetic leakage of the circuit itself are separate questions and
+  out of scope.
 
 ## How this differs from Janus
 
 Janus (*Automated Generation of RISC-V Extensions with Formal Correctness
 Guarantees*, Alvanaki, Wang, Muscinelli and Carloni, MLArchSys 2026) also keeps
-correctness outside the agent, with a three-stage chain on the Ibex core.
-Two differences matter. Janus lets the agent write the patch that integrates
-the instruction into the core, and checks the integrated core with bounded
-model checking; the cage never lets the agent touch the core, and its "no
-memory" rule makes the equivalence proof unbounded. Janus also treats the
-agent as possibly wrong; the cage's candidates assume it may be malicious.
+correctness outside the agent, with a three-stage chain on the Ibex core. It
+already treats every agent artifact as untrusted, and it already restricts
+instructions to single-cycle combinational operations, so neither is a
+difference here.
+
+The difference is who integrates the instruction. In Janus the agent writes
+the patch that wires it into Ibex's decode, routing and control, and a
+bounded RVFI check verifies the integrated core. Here the agent would write
+only the arithmetic function, and integration would be a fixed wrapper
+verified once. The open question is whether that restriction keeps useful
+speed-ups while enabling stronger, reusable guarantees. A fair answer needs
+both kinds of integration on the same core: comparing Janus's Ibex numbers
+with another core would mix up interface overhead with processor
+differences.
+
+Using LLMs to attack hardware is not new either: researchers at Georgia Tech
+used a general-purpose LLM to design a hardware Trojan for a RISC-V CPU
+([Harnessing the Power of General-Purpose LLMs in Hardware Trojan
+Design](https://astrolavos.gatech.edu/2024/03/30/AIHWS2024/), AIHWS 2024).
 
 ## Writing a candidate
 
