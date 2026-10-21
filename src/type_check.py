@@ -211,8 +211,8 @@ class TypeChecker():
             case ast.Subscript():
                 return self.evalSubscript(node)
             case _:
-                print(f'Unknown node type: {node}')
-                assert False
+                self.errorInfo.lineNo = getattr(node, 'lineno', 0)
+                raiseError(self.errorInfo, f'Unsupported syntax: {type(node).__name__} is outside the compiled subset')
 
     def evalSubscript(self, node: ast.Subscript) -> CheckedSubscriptNode:
         """
