@@ -91,6 +91,20 @@ python -m src.runner tests/standard.py --count   # ...and count executed instruc
 which functions. [docs/measuring.md](docs/measuring.md) explains how it works
 and has short exercises for reading the results.
 
+### Checking AI-proposed instructions
+
+```bash
+python -m src.cage examples/cage/pid.py q15mul examples/cage/candidates/*.v
+```
+
+checks candidate circuits for a custom instruction that would replace
+`q15mul`, the hot function of a fixed-point PID controller. The answer key
+comes from the compiler's IR, never from whoever wrote the circuit, and a
+circuit is accepted only with the right interface, no memory, and a Z3 proof
+that it matches for every input. The candidates include a backdoor, a time
+bomb and a subtle saturation bug; all are rejected. See
+[docs/cage.md](docs/cage.md).
+
 Without a glibc cross toolchain (`PYRV_CC` or
 `riscv32-unknown-linux-gnu-clang` on `PATH`), the runner links with Zig's
 bundled clang and musl. The result is a static rv32gc/ilp32d executable that
