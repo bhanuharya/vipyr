@@ -634,6 +634,10 @@ class LLVMBackend():
                 else:
                     self.builder.ret(ir.Constant(retType.toLLVM(), None))
 
+        # Drop the argument scope. Left on the stack, it turned every later
+        # module-level variable into a local of main, which later functions
+        # then referenced across function boundaries.
+        self.symbols.pop()
         self.fn = was_fn
         self.builder = was_builder
 

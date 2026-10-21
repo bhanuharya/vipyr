@@ -272,6 +272,22 @@ print(x)
         self.check_equivalence(src)
         self.check_equivalence(src, passes=DEFAULT_PASSES)
 
+    def test_globals_declared_after_functions(self):
+        # Regression: these globals used to become locals of main, so f
+        # read other functions' values (or failed to compile).
+        src = '''
+def first(x: int) -> int:
+    return x
+K1 = 7
+K2: int16 = 300
+def f(a: int, b: int16, c: int) -> int:
+    return K1 * 100 + a * 10 + int(K2) + int(b) + c
+print(f(1, 2, 3))
+print(first(K1))
+'''
+        self.check_equivalence(src)
+        self.check_equivalence(src, passes=DEFAULT_PASSES)
+
     def test_narrow_ints(self):
         # Edge cases go through arguments so constant folding can't hide
         # the generated code.

@@ -219,6 +219,22 @@ print(get())
         # The function body must reference the @g_c global.
         self.assertRegex(ir, r'load i32, i32\* @"?g_c"?')
 
+    def test_global_declared_after_a_function(self):
+        # Regression: the backend never popped a function's argument scope,
+        # so K became an alloca in main and f read another function's value.
+        src = '''
+def first(x: int) -> int:
+    return x
+K = 7
+def f(a: int, b: int, c: int) -> int:
+    return K * a + b
+print(f(1, 2, 3))
+'''
+        ir = ir_text_for(src)
+        llvm.parse_assembly(ir).verify()
+        body = ir.split('define i32 @"test.f"', 1)[1].split('\n}', 1)[0]
+        self.assertRegex(body, r'load i32, i32\* @"?g_K"?')
+
     def test_function_writes_global(self):
         src = '''
 counter = 0
