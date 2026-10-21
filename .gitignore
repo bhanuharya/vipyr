@@ -167,3 +167,13 @@ cython_debug/
 
 # pyrv compiler output
 out.ll
+
+# Generated compiler/build artifacts
+a.out
+a.riscv
+a.riscv.tmp
+out.ll
+optimized.bc
+optimized.s
+*_output.txt
+bin/
